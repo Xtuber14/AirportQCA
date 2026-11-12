@@ -75,6 +75,22 @@ public:
 
     virtual IOReturn setPowerState(unsigned long powerStateOrdinal, IOService *whatDevice) APPLE_KEXT_OVERRIDE;
 
+    /* IO80211Controller pure virtual overrides */
+    virtual SInt32 stopDMA() APPLE_KEXT_OVERRIDE;
+    virtual UInt32 hardwareOutputQueueDepth(IO80211Interface *interface) APPLE_KEXT_OVERRIDE;
+    virtual SInt32 performCountryCodeOperation(IO80211Interface *interface, IO80211CountryCodeOp op) APPLE_KEXT_OVERRIDE;
+    virtual SInt32 enableFeature(IO80211FeatureCode code, void *data) APPLE_KEXT_OVERRIDE;
+
+    /* IO80211Controller virtual overrides (non-pure, but needed for concrete instantiation) */
+    virtual int bpfOutputPacket(OSObject *obj, UInt type, mbuf_t m) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn getHardwareAddressForInterface(IO80211Interface *interface, IOEthernetAddress *addr) APPLE_KEXT_OVERRIDE;
+    virtual SInt32 monitorModeSetEnabled(IO80211Interface *interface, bool enabled, UInt channel) APPLE_KEXT_OVERRIDE;
+    virtual void requestPacketTx(void *data, UInt length) APPLE_KEXT_OVERRIDE;
+    virtual SInt32 enableVirtualInterface(IO80211VirtualInterface *vif) APPLE_KEXT_OVERRIDE;
+    virtual SInt32 disableVirtualInterface(IO80211VirtualInterface *vif) APPLE_KEXT_OVERRIDE;
+    virtual IO80211VirtualInterface* createVirtualInterface(ether_addr *addr, UInt role) APPLE_KEXT_OVERRIDE;
+    virtual SInt32 apple80211VirtualRequest(UInt request_type, int request_number, IO80211VirtualInterface *vif, void *data) APPLE_KEXT_OVERRIDE;
+
     /* Hardware & interrupt handling */
     static bool interruptFilter(OSObject *owner, IOFilterInterruptEventSource *src);
     static void interruptAction(OSObject *owner, IOInterruptEventSource *src, int count);

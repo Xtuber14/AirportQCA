@@ -14,7 +14,7 @@
 #include "../include/Apple80211/Apple80211.h"
 
 #include <IOKit/pci/IOPCIDevice.h>
-#include <IOKit/IOMemoryMap.h>
+#include <IOKit/IOMemoryDescriptor.h>
 
 class AirportQCA;
 class QCACopyEngine;

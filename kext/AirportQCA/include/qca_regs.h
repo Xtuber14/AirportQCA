@@ -17,7 +17,7 @@
 #define PCIE_INTR_CLR_ADDRESS               0x00000014
 #define CORE_CTRL_ADDRESS                   0x00000020
 
-#define CORE_CTRL_PCIE_REG_31_MASK          0x00000800
+#define CORE_CTRL_PCIE_REG_31_MASK          0x00000800U
 
 /* Interrupt bits */
 #define PCIE_INTR_FIRMWARE_MASK             0x00000400

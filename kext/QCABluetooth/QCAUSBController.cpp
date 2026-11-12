@@ -4,6 +4,8 @@
 //
 
 #include "QCAUSBController.hpp"
+#include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 
 #define super OSObject
 OSDefineMetaClassAndStructors(QCAUSBController, OSObject)
@@ -78,8 +80,15 @@ IOReturn QCAUSBController::bulkWrite(const void *data, uint32_t length, uint32_t
         return kIOReturnNotOpen;
     }
 
+    IOMemoryDescriptor *desc = IOBufferMemoryDescriptor::withBytes(data, length, kIODirectionOut);
+    if (!desc) {
+        return kIOReturnNoMemory;
+    }
+
     uint32_t transferred = 0;
-    return fBulkOutPipe->io(const_cast<void*>(data), length, transferred, timeoutMs);
+    IOReturn ret = fBulkOutPipe->io(desc, length, transferred, timeoutMs);
+    desc->release();
+    return ret;
 }
 
 bool QCAUSBController::resetController()

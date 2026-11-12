@@ -216,8 +216,8 @@ void QCAPCIDevice::startScan()
 void QCAPCIDevice::associate(apple80211_assoc_data *assoc)
 {
     if (fWmi && assoc) {
-        fWmi->createPeer(0, assoc->bssid.octet);
-        fWmi->associatePeer(0, assoc->bssid.octet, assoc);
+        fWmi->createPeer(0, assoc->ad_bssid.octet);
+        fWmi->associatePeer(0, assoc->ad_bssid.octet, assoc);
     }
 }
 
