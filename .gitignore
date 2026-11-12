@@ -1,0 +1,15 @@
+# macOS / Xcode metadata
+.DS_Store
+*.swp
+*~
+DerivedData/
+build/
+*.dSYM/
+
+# Reference source directories (tracked in their own upstream repos)
+source/
+
+# Compiled objects
+*.o
+*.d
+*.kext
