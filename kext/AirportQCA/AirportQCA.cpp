@@ -847,6 +847,11 @@ IOReturn AirportQCA::prepareSkywalkBSDInterface(ifnet_t interface)
 
 #ifdef IO80211FAMILY_V2
 bool AirportQCA::isCommandProhibited(int) { return false; }
+SInt32 AirportQCA::enableFeature(IO80211FeatureCode code, void *data)
+{
+    qca_info("enableFeature: code=%d", (int)code);
+    return kIOReturnSuccess;
+}
 SInt32 AirportQCA::handleCardSpecific(IO80211SkywalkInterface *, unsigned long, void *, bool) { return kIOReturnUnsupported; }
 IOReturn AirportQCA::getDRIVER_VERSION(IO80211SkywalkInterface *, apple80211_version_data *d) { if (!d) return kIOReturnBadArgument; memset(d, 0, sizeof(*d)); d->version = APPLE80211_VERSION; d->string_len = (u_int16_t)snprintf(d->string, sizeof(d->string), "AirportQCA Tahoe"); return kIOReturnSuccess; }
 IOReturn AirportQCA::getHARDWARE_VERSION(IO80211SkywalkInterface *, apple80211_version_data *d) { if (!d) return kIOReturnBadArgument; memset(d, 0, sizeof(*d)); d->version = APPLE80211_VERSION; d->string_len = (u_int16_t)snprintf(d->string, sizeof(d->string), "Qualcomm Atheros QCA9377"); return kIOReturnSuccess; }
@@ -877,6 +882,7 @@ CommonFaultReporter *AirportQCA::getFaultReporterFromDriver() { return nullptr; 
 UInt32 AirportQCA::hardwareOutputQueueDepth() { return 64; }
 SInt32 AirportQCA::performCountryCodeOperation(IO80211CountryCodeOp) { return kIOReturnSuccess; }
 SInt32 AirportQCA::monitorModeSetEnabled(bool, unsigned int) { return kIOReturnUnsupported; }
+
 #else
 // -------------------------------------------------------
 // IO80211Controller pure virtual overrides

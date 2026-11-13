@@ -42,6 +42,10 @@ public:
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
 
 #ifdef IO80211FAMILY_V2
+    virtual void _RESERVEDIONetworkController2() __asm__("__ZN19IONetworkController11outputStartEP18IONetworkInterfacej") APPLE_KEXT_OVERRIDE;
+    virtual void _RESERVEDIONetworkController3() __asm__("__ZN19IONetworkController27setInputPacketPollingEnableEP18IONetworkInterfaceb") APPLE_KEXT_OVERRIDE;
+    virtual void _RESERVEDIONetworkController4() __asm__("__ZN19IONetworkController16pollInputPacketsEP18IONetworkInterfacejP11IOMbufQueuePv") APPLE_KEXT_OVERRIDE;
+    virtual void _RESERVEDIONetworkController5() __asm__("__ZN19IONetworkController28networkInterfaceNotificationEP18IONetworkInterfacejPv") APPLE_KEXT_OVERRIDE;
     virtual IOReturn enable(IONetworkInterface *netif) APPLE_KEXT_OVERRIDE;
     virtual IOReturn disable(IONetworkInterface *netif) APPLE_KEXT_OVERRIDE;
 #else
@@ -97,10 +101,6 @@ public:
     virtual IOReturn setGET_DEBUG_INFO(IO80211SkywalkInterface *, apple80211_debug_command *) APPLE_KEXT_OVERRIDE;
     virtual CCLogStream *getLogger() const APPLE_KEXT_OVERRIDE;
     virtual CommonFaultReporter *getFaultReporterFromDriver() APPLE_KEXT_OVERRIDE;
-    virtual bool requiresExplicitMBufRelease() APPLE_KEXT_OVERRIDE { return false; }
-    virtual bool flowIdSupported() APPLE_KEXT_OVERRIDE { return false; }
-    virtual bool getLogPipes(CCPipe **, CCPipe **, CCPipe **) APPLE_KEXT_OVERRIDE { return false; }
-    virtual IOReturn requestQueueSizeAndTimeout(unsigned short *, unsigned short *) APPLE_KEXT_OVERRIDE { return kIOReturnSuccess; }
     virtual UInt32 hardwareOutputQueueDepth() APPLE_KEXT_OVERRIDE;
     virtual SInt32 performCountryCodeOperation(IO80211CountryCodeOp) APPLE_KEXT_OVERRIDE;
     virtual SInt32 monitorModeSetEnabled(bool enabled, unsigned int channel) APPLE_KEXT_OVERRIDE;

@@ -12,10 +12,10 @@ This document details the exact protocols, binary container layouts, and hardwar
 
 ## 2. Wi-Fi Firmware Ecosystem & Binary Artifacts
 
-In the reference Linux repository (`source/linux-firmware/ath10k/QCA9377/hw1.0`), the Wi-Fi subsystem requires three critical binary assets:
+In the repository firmware directory (`firmware/ath10k/QCA9377/hw1.0/`), the Wi-Fi subsystem requires the following binary assets:
 
 ```
-source/linux-firmware/ath10k/QCA9377/hw1.0/
+firmware/ath10k/QCA9377/hw1.0/
 ├── board-2.bin               (Multi-board calibration database, ~300 KB)
 ├── board.bin                 (Fallback raw calibration data, exactly 8,124 bytes)
 ├── firmware-5.bin            (WMI-TLV Firmware API 5, ~780 KB)
@@ -123,7 +123,7 @@ sequenceDiagram
 The Bluetooth controller is an integrated Rome core connected over USB. Unlike Wi-Fi which uses BMI over PCIe, Bluetooth firmware is loaded using the **Qualcomm Bluetooth DFU (Device Firmware Upgrade)** protocol over USB.
 
 ### 4.1 Required Firmware Artifacts
-From `source/linux-firmware/qca`:
+From `firmware/qca/`:
 1. `rampatch_usb_00000302.bin`: Firmware patch code for Rome 3.2 (~68 KB).
 2. `nvm_usb_00000302.bin`: Non-Volatile Memory table containing crystal calibration, BD_ADDR, and RF configurations (~6.3 KB).
 

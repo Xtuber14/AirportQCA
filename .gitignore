@@ -13,3 +13,7 @@ source/
 *.o
 *.d
 *.kext
+
+# Python bytecode
+__pycache__/
+*.pyc

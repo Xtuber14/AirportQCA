@@ -143,8 +143,6 @@ class IO80211Controller : public IOEthernetController {
     OSDeclareAbstractStructors(IO80211Controller)
 public:
     IOReturn postMessage(IO80211SkywalkInterface *, unsigned int, void *, unsigned long, bool);
-    virtual void _RESERVEDIONetworkController6() __asm__("__ZN19IONetworkController20allocatePacketNoWaitEj");
-    virtual void _RESERVEDIONetworkController7() __asm__("__ZN19IONetworkController18setHardwareAssistsEjj");
     virtual void free();
     virtual bool init(OSDictionary*);
     virtual IOReturn configureReport(IOReportChannelList*, unsigned int, void*, void*);
