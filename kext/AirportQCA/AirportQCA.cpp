@@ -302,8 +302,10 @@ IOReturn AirportQCA::enable(IONetworkInterface *netif)
     if (fHalDevice) {
         static_cast<QCAPCIDevice*>(fHalDevice)->start();
     }
-    setLinkStatus(kIONetworkLinkValid | kIONetworkLinkActive);
-    fLinkActive = true;
+    /* Device enable only means firmware is running. The link must stay down
+     * until the station association path confirms a peer is actually joined. */
+    setLinkStatus(kIONetworkLinkValid);
+    fLinkActive = false;
     return kIOReturnSuccess;
 }
 
