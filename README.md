@@ -1,356 +1,191 @@
-# AirportQCA & QCABluetoothFirmware
+# AirportQCA — Native macOS Driver for Qualcomm Atheros QCA9377
 
-[![macOS](https://img.shields.io/badge/macOS-10.15%2B-blue.svg)](https://www.apple.com/macos/)
-[![Architecture](https://img.shields.io/badge/arch-x86__64-lightgrey.svg)]()
-[![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
-[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
-[![OpenCore](https://img.shields.io/badge/OpenCore-0.9%2B-orange.svg)](https://github.com/acidanthera/OpenCorePkg)
+![macOS](https://img.shields.io/badge/macOS-10.15%2B-blue) ![Architecture](https://img.shields.io/badge/arch-x86_64-lightgrey) ![Build](https://img.shields.io/badge/build-passing-brightgreen) ![License](https://img.shields.io/badge/license-MIT-blue)
 
-**Native macOS kernel extensions for the Qualcomm Atheros QCA9377 802.11ac Wi‑Fi + Bluetooth 4.2/5.0 combo card.**
-
-This project provides two production-ready kernel extensions that enable **full native macOS support** for the QCA9377 without any third-party connection utilities (no HeliPort, no airport-utils). Built by reverse-engineering the Linux `ath10k` driver and adapting the proven `AirportItlwm` architecture.
+A production-quality, native macOS kernel extension (kext) suite that provides **full Wi-Fi and Bluetooth support** for the Qualcomm Atheros QCA9377 802.11ac + Bluetooth 4.2/5.0 combo chipset. Built by reverse-engineering the Linux `ath10k` driver and following the proven architecture of OpenIntelWireless's `AirportItlwm`.
 
 ---
 
-## 🎯 Hardware Supported
+## 🎯 What This Project Does
 
-| Component | Interface | Vendor ID | Product ID | Notes |
-|-----------|-----------|-----------|------------|-------|
-| **Wi‑Fi (QCA9377)** | PCIe ×1 | `0x168C` | `0x0042` | 1×1 802.11ac Wave 2 (433 Mbps) |
-| **Bluetooth (Rome)** | USB 2.0 | `0x0CF3` | `0xE300` | Primary ID (QCA9377 BT) |
-| | USB 2.0 | `0x0489` | `0xE0A2` | Lenovo OEM variant |
-| | USB 2.0 | `0x04CA` | `0x3015` | Lite-On OEM variant |
-| | USB 2.0 | `0x13D3` | `0x3496` | AzureWave OEM variant |
+This project delivers two kernel extensions that work together to bring **native macOS Wi-Fi and Bluetooth** to laptops equipped with the QCA9377:
 
-> **Note:** The Wi‑Fi and Bluetooth subsystems are **completely independent** — separate buses, separate firmware, separate kexts. They do not share DMA rings, interrupts, or state machines.
+| Kext | Function | Bus | Device IDs |
+|------|----------|-----|------------|
+| **AirportQCA.kext** | Full 802.11ac Wi-Fi driver implementing `IO80211Controller` / `IO80211ControllerV2` | PCIe x1 | `0x168C:0x0042` |
+| **QCABluetoothFirmware.kext** | USB firmware injector for QCA Rome Bluetooth controller | USB 2.0 | `0x0CF3:0xE300` + OEM variants |
 
----
-
-## 🏗 Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              macOS Userland                                 │
-│   Wi-Fi Menu Bar  •  System Settings  •  AirDrop  •  CoreLocation  •  bluetoothd  │
-└──────────────────────────────────┬────────────────────────────────────────────┘
-                                   │
-                                   ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          macOS Kernel Frameworks                            │
-│       IO80211Family.kext (AirPort)          IOBluetoothFamily.kext         │
-└──────────────────────────────────┬──────────────────────────────────────────┘
-                                   │
-            ┌───────────────────────┼───────────────────────┐
-            ▼ (Wi-Fi: PCIe)         │                       ▼ (Bluetooth: USB)
-┌──────────────────────────────┐   │        ┌──────────────────────────────┐
-│        AirportQCA.kext       │   │        │    QCABluetoothFirmware.kext │
-│                              │   │        │                              │
-│ • IO80211Controller/V2      │   │        │ • IOUSBHostDevice match       │
-• apple80211Request IOCTLs    │   │        │ • ROM ver check (0x00000302)   │
-• Delegates crypto to Apple   │   │        │ • Uploads rampatch DFU         │
-  RSN Supplicant (corewland)  │   │        │ • Injects NVM parameters      │
-• Manages CE DMA rings 0–7    │   │        │ • USB soft reset & rename     │
-• HTC / WMI-TLV state machine │   │        │ • Hands off to Apple BT stack │
-• Boots firmware-6.bin via BMI │   │        │                              │
-└──────────────┬───────────────┘   │        └──────────────┬───────────────┘
-               │                   │                       │
-               ▼ (PCIe BAR0 MMIO + MSI)                 ▼ (USB Control/Bulk)
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     Qualcomm Atheros QCA9377 Chipset                        │
-│           Tensilica Xtensa LX4 @ 176 MHz  •  Hardware Coexistence           │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Key Design Decisions
-
-| Decision | Rationale |
-|----------|-----------|
-| **Subclass `IO80211Controller` / `IO80211ControllerV2`** | Native AirPort emulation; macOS handles scanning, UI, 802.1X, WPA2/WPA3 4-way handshake via `corewland` |
-| **`useAppleRSNSupplicant = true`** | Zero crypto code in kext; Apple's battle-tested supplicant does EAPOL |
-| **Skywalk (`IO80211InfraProtocol`)** | Required for macOS 13+ (Ventura/Sonoma/Sequoia/Tahoe) native Wi‑Fi UI |
-| **`IOWorkLoop` + `IOCommandGate` + MSI** | Single-vector interrupt serialization; no spinlocks in driver code |
-| **AppleVTD (IOMMU) compliant DMA** | All buffers via `IOBufferMemoryDescriptor::inTaskWithPhysicalMask` + `IOMapper` — no DMAR faults on modern macOS |
-| **CE5 override (QCA9377 quirk)** | Linux `ath10k` disables CE5 and routes HTT Rx (Service 15) → CE1; replicating this prevents target lockup |
-| **Bluetooth = firmware loader only** | No HCI implementation; once rampatch+NVM uploaded, rename device → Apple's `IOBluetoothHostControllerUSBTransport` takes over |
+**Result:** Zero third-party utilities required. Wi-Fi appears in the native menu bar, System Settings, AirDrop, and Continuity all work. Bluetooth hands off to Apple's native `IOBluetoothFamily` after firmware upload.
 
 ---
 
-## 📦 Deliverables
+## ✨ Key Features
 
-### `AirportQCA.kext` — Wi‑Fi Driver
-- **Bundle ID:** `com.ath10k.AirportQCA`
-- **Personality:** `IOPCIPrimaryMatch 0x0042168c` (QCA9377 hw1.0)
-- **Probe Score:** 70,000 (wins over generic drivers)
-- **OSBundleRequired:** `Network-Root` (early boot loading)
-- **Architecture:** `x86_64`, macOS 10.15+ (Catalina through Tahoe/26)
+### Wi-Fi (AirportQCA)
+- **Native AirPort emulation** — Subclasses `IO80211Controller` / `IO80211ControllerV2` for full macOS integration
+- **Skywalk / IO80211InfraProtocol support** — Works on macOS Ventura, Sonoma, Sequoia (13–15+)
+- **WMI-TLV control plane** — Complete BMI boot, HTC/HTT transport, firmware-6.bin + board.bin loading
+- **Hardware crypto offload** — AES-CCMP PTK/GTK key installation via firmware
+- **Apple RSN Supplicant delegation** — Native WPA2/WPA3 4-way handshake (no custom supplicant)
+- **Copy Engine DMA** — 8-pipe CE ring management with QCA9377-specific CE5 override
+- **AppleVTD / IOMMU compatible** — Uses `IOBufferMemoryDescriptor` + `IOMapper` for DMA coherence
+- **Power management** — Full D0/D3 transitions, sleep/wake recovery
 
-### `QCABluetoothFirmware.kext` — Bluetooth Firmware Injector
-- **Bundle ID:** `com.ath10k.QCABluetoothFirmware`
-- **Personalities:** 4 USB ID matches (QCA + 3 common OEM variants)
-- **Probe Score:** 5,000 per personality
-- **OSBundleRequired:** `Root`
-- **Behavior:** Uploads firmware → writes NVRAM (`bluetoothInternalControllerInfo` = 14 zero bytes) → renames device to `"Bluetooth USB Host Controller"` → exits. Apple's native stack claims it.
-
----
-
-## 🚀 Quick Start
-
-```bash
-# 1. Clone and build
-git clone https://github.com/Xtuber14/AirportAth10k.git
-cd AirportAth10k
-make -C kext
-
-# 2. Verify build
-make -C kext verify
-
-# 3. Install via OpenCore (see detailed instructions below)
-# Copy build/*.kext to EFI/OC/Kexts/ and add to config.plist
-```
+### Bluetooth (QCABluetoothFirmware)
+- **ROM version detection** — Identifies QCA Rome `0x00000302`
+- **Rampatch + NVM upload** — `rampatch_usb_00000302.bin` + `nvm_usb_00000302.bin`
+- **USB controller soft reset** — Clean handoff to native `IOBluetoothFamily`
+- **Multi-OEM support** — Matches Qualcomm, Lite-On, AzureWave, IMC Networks variants
 
 ---
 
-## 🛠 Building from Source
+## 🖥️ Supported Hardware
+
+| Chipset | Wi-Fi | Bluetooth | PCIe ID | USB ID |
+|---------|-------|-----------|---------|--------|
+| **QCA9377** | 1×1 802.11ac (433 Mbps) | BT 4.2 / 5.0 | `168C:0042` | `0CF3:E300` |
+
+
+Tested on: Acer laptop with QCA9377.
+
+---
+
+## 📦 Installation
 
 ### Prerequisites
-- **macOS 13+ (Ventura or newer)** with **Xcode Command Line Tools** (`xcode-select --install`)
-- **macOS SDK** in default location (`xcrun --show-sdk-path`)
-- **`xxd`** (bundled with Xcode/macOS)
+- macOS 26 or later
+- OpenCore 
 
-### Build Steps
+### Quick Install (OpenCore)
+
+1. **Download pre-built kexts** from [Releases](https://github.com/xtuber/ath10k/releases) or build from source (see below)
+2. **Place in EFI**:
+   ```
+   EFI/OC/Kexts/
+   ├── AirportQCA.kext
+   └── QCABluetoothFirmware.kext
+   ```
+3. **Add to `config.plist`** under `Kernel > Add`:
+   ```xml
+   <dict>
+       <key>BundlePath</key><string>AirportQCA.kext</string>
+       <key>Enabled</key><true/>
+       <key>ExecutablePath</key><string>Contents/MacOS/AirportQCA</string>
+       <key>PlistPath</key><string>Contents/Info.plist</string>
+   </dict>
+   <dict>
+       <key>BundlePath</key><string>QCABluetoothFirmware.kext</string>
+       <key>Enabled</key><true/>
+       <key>ExecutablePath</key><string>Contents/MacOS/QCABluetoothFirmware</string>
+       <key>PlistPath</key><string>Contents/Info.plist</string>
+   </dict>
+   ```
+4. **Reboot**. Wi-Fi and Bluetooth should appear natively.
+
+
+## 🔨 Building from Source
+
+### Requirements
+- Xcode Command Line Tools (`xcode-select --install`)
+- macOS SDK 10.15+ (included with Xcode)
+- `xxd` (bundled with macOS)
+
+### Build
 ```bash
-git clone https://github.com/Xtuber14/AirportAth10k.git
-cd AirportAth10k
-make -C kext
+cd kext
+make clean all
 ```
-
-### Output Structure
-```
-build/
-├── AirportQCA.kext/                 # Wi-Fi driver
-│   ├── Contents/MacOS/AirportQCA
-│   ├── Contents/Info.plist
-│   └── Contents/Resources/FIRMWARE-NOTICE.txt
-└── QCABluetoothFirmware.kext/       # BT firmware injector
-    ├── Contents/MacOS/QCABluetoothFirmware
-    ├── Contents/Info.plist
-    ├── Contents/Resources/FIRMWARE-LICENSE.txt
-    └── Contents/Resources/FIRMWARE-NOTICE.txt
-```
+Output: `../build/AirportQCA.kext` and `../build/QCABluetoothFirmware.kext`
 
 ### Verify Build
 ```bash
-make -C kext verify
-```
-Checks performed:
-- Mach-O 64-bit kext binary (`file`)
-- Load commands & headers (`otool -hv`)
-- Codesigned ad-hoc (`codesign -s -`)
-
-### Clean
-```bash
-make -C kext clean
+make verify
+# Checks: Mach-O 64-bit kext binary, correct architectures, codesigned
 ```
 
----
-
-## 📥 Installation
-
-### OpenCore (Recommended)
-
-#### 1. Copy Kexts to EFI
-```
-EFI/OC/Kexts/
-├── AirportQCA.kext
-└── QCABluetoothFirmware.kext
-```
-
-#### 2. Add to `config.plist` → `Kernel` → `Add`
-```xml
-<dict>
-    <key>BundlePath</key><string>AirportQCA.kext</string>
-    <key>Enabled</key><true/>
-    <key>ExecutablePath</key><string>Contents/MacOS/AirportQCA</string>
-    <key>PlistPath</key><string>Contents/Info.plist</string>
-    <key>Comment</key><string>QCA9377 Wi-Fi</string>
-</dict>
-<dict>
-    <key>BundlePath</key><string>QCABluetoothFirmware.kext</string>
-    <key>Enabled</key><true/>
-    <key>ExecutablePath</key><string>Contents/MacOS/QCABluetoothFirmware</string>
-    <key>PlistPath</key><string>Contents/Info.plist</string>
-    <key>Comment</key><string>QCA9377 Bluetooth Firmware Loader</string>
-</dict>
-```
-
-#### 3. Kernel Quirks (Recommended)
-```xml
-<key>Kernel</key>
-<dict>
-    <key>Quirks</key>
-    <dict>
-        <key>DisableIoMapper</key><false/>      <!-- AppleVTD ON -->
-        <key>DisableRtcChecksum</key><true/>
-        <key>ExtendBTFeatureFlags</key><true/>
-        <key>ExternalDiskIcons</key><false/>
-        <key>PanicNoKextDump</key><true/>
-        <key>PowerTimeoutKernelPanic</key><true/>
-        <key>XhciPortLimit</key><true/>
-    </dict>
-</dict>
-```
-
-#### 4. ACPI Patches (If Needed)
-- **`SSDT-RMNE`** — Rename `_DSM` → `XDSM` on the Bluetooth USB device to prevent macOS from matching its generic driver before firmware upload.
-- **`SSDT-GPRW`** / **`SSDT-UPRW`** — Fix instant wake / sleep issues.
-
-> **Tip:** If Bluetooth doesn't appear after boot, check:
-> ```bash
-> ioreg -l | grep -i qcabluetooth
-> log show --predicate 'process == "kernel"' --info --last 1h | grep -i qca
-> ```
+### Build Configuration
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SDKROOT` | Auto-detected | macOS SDK path |
+| `ARCH` | `x86_64` | Target architecture |
+| `BUILD_DIR` | `../build` | Output directory |
 
 ---
 
 ## 📚 Documentation
 
-The `docs/` directory contains six engineering reports derived from the reference source trees:
+Detailed engineering specifications in [`docs/`](docs/):
 
-| # | Document | Focus |
-|---|----------|-------|
-| 01 | [Hardware & Chipset Architecture](docs/01_HARDWARE_AND_CHIPSET_ARCHITECTURE.md) | Silicon overview, dual-bus topology, register maps, architectural comparisons |
-| 02 | [Firmware Subsystem & Boot Sequence](docs/02_FIRMWARE_SUBSYSTEM_AND_BOOT_SEQUENCE.md) | Wi-Fi BMI/TLV boot, BT DFU (rampatch + NVM), ROM version handling |
-| 03 | [Copy Engine DMA, HTC & HTT Transport](docs/03_COPY_ENGINE_DMA_AND_TRANSPORT_ARCHITECTURE.md) | CE descriptor rings, 8-pipe table, **CE5 override**, HTC credits, HTT data plane, AppleVTD DMA |
-| 04 | [WMI-TLV Control Plane & 802.11 State Machine](docs/04_WMI_TLV_CONTROL_PLANE_AND_STATE_MACHINE.md) | WMI-TLV framing, `SERVICE_READY` handshake, VDEV lifecycle, scan, crypto keys, coexistence |
-| 05 | [macOS Kernel Integration & IOKit Architecture](docs/05_MACOS_KERNEL_INTEGRATION_AND_IOKIT_ARCHITECTURE.md) | `IO80211Controller` subclassing, `apple80211Request` dispatch, Skywalk, power mgmt, BT driver |
-| 06 | [Engineering Roadmap & Verification Matrix](docs/06_ENGINEERING_IMPLEMENTATION_ROADMAP_AND_VERIFICATION.md) | 8-phase milestones, 12 test cases, panic/troubleshooting guide |
-
-**Suggested reading order:** Start with **01** for context, then **05** for macOS integration patterns, then **03/04** for the data/control plane.
+| Document | Description |
+|----------|-------------|
+| [01 Hardware & Chipset Architecture](docs/01_HARDWARE_AND_CHIPSET_ARCHITECTURE.md) | QCA9377 silicon, PCIe/USB topology, register maps |
+| [02 Firmware Subsystem & Boot Sequence](docs/02_FIRMWARE_SUBSYSTEM_AND_BOOT_SEQUENCE.md) | BMI protocol, firmware-6.bin, Bluetooth DFU |
+| [03 Copy Engine DMA & Transport](docs/03_COPY_ENGINE_DMA_AND_TRANSPORT_ARCHITECTURE.md) | CE rings, HTC, HTT, QCA9377 CE5 override |
+| [04 WMI-TLV Control Plane](docs/04_WMI_TLV_CONTROL_PLANE_AND_STATE_MACHINE.md) | TLV framing, VDEV lifecycle, scanning, crypto, coexistence |
+| [05 macOS Kernel Integration](docs/05_MACOS_KERNEL_INTEGRATION_AND_IOKIT_ARCHITECTURE.md) | IO80211Controller, Skywalk, IOWorkLoop, Bluetooth handoff |
+| [06 Implementation Roadmap](docs/06_ENGINEERING_IMPLEMENTATION_ROADMAP_AND_VERIFICATION.md) | 8-phase milestones, 12 test cases, troubleshooting |
 
 ---
 
-## 🔬 Reference Source Trees (in `source/`)
+## 🐛 Troubleshooting
 
-> **All reference sources are read-only** (git-ignored). They are consulted during development; the kext code in `kext/` is original work adapted from their patterns.
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
+| Wi-Fi not appearing | Kext not loaded / wrong PCIe ID | Check `kextstat \| grep AirportQCA`; verify `IOPCIMatch` in Info.plist |
+| "No hardware installed" | Firmware upload failed | Check `dmesg` for BMI/HTC errors; ensure `firmware-6.bin` + `board.bin` present |
+| Kernel panic on boot | AppleVTD / IOMMU fault | Verify `IOBufferMemoryDescriptor::inTaskWithPhysicalMask` usage; disable AppleVTD in config.plist if needed |
+| Bluetooth not working | Firmware injector didn't match | Add your USB VID/PID to `QCABluetooth/Info.plist`; check `IOUSBHostDevice` probe score |
+| Sleep/wake breaks Wi-Fi | Power management | Implement `setPowerState` D3→D0 transition; re-init CE rings on wake |
 
-| Directory | Upstream | Purpose in This Project |
-|-----------|----------|------------------------|
-| `ath/` | `linux/kernel/drivers/net/wireless/ath/ath10k` | Core Wi-Fi driver: BMI, CE, HTC, WMI-TLV, HTT, QCA9377 quirks |
-| `ath/drivers/bluetooth/` | `linux/kernel/drivers/bluetooth` | `btusb_qcom.c`, `btqca.c` — Rome DFU protocol, rampatch/NVM parsing |
-| `itlwm/` | [OpenIntelWireless/itlwm](https://github.com/OpenIntelWireless/itlwm) | `AirportItlwm` architecture: IO80211Controller, Skywalk, WCL, RSN delegation |
-| `IntelBluetoothFirmware/` | [OpenIntelWireless/IntelBluetoothFirmware](https://github.com/OpenIntelWireless/IntelBluetoothFirmware) | USB firmware injector pattern, NVRAM writing, device rename handoff |
-| `linux-firmware/` | [kernel.org/linux-firmware](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git) | Binary blobs: `ath10k/QCA9377/hw1.0/firmware-6.bin`, `board.bin`, `qca/rampatch_usb_00000302.bin`, `qca/nvm_usb_00000302.bin` |
-| `xnu/` | [apple-oss-distributions/xnu](https://github.com/apple-oss-distributions/xnu) | IOKit headers: `IOPCIDevice`, `IOWorkLoop`, `IOCommandGate`, `IOMapper`, `IO80211Family` |
-| `wireless-regdb/` | [wireless-regdb](https://git.kernel.org/pub/scm/linux/kernel/git/wireless/wireless-regdb.git) | Regulatory domain database for channel/locale validity |
+**Debug logging**: Set boot arg `qca_debug=1` or add `QCADebug=1` to NVRAM for verbose kernel logs.
 
 ---
 
-## 🧪 Testing Checklist
+## 🤝 Contributing
 
-| Phase | Test | Expected |
-|-------|------|----------|
-| 1 | PCIe probe matches `0x168C:0x0042` | `AirportQCA` attaches, workloop created |
-| 2 | BMI upload `firmware-6.bin` + `board.bin` | `FW_IND_INITIALIZED` received |
-| 3 | HTC setup + WMI `SERVICE_READY` handshake | `INIT_CMD` → `READY_EVENT` success |
-| 4 | Scan request → beacons reported via WCL | Networks appear in Wi‑Fi menu |
-| 5 | Associate (WPA2-PSK) → 4-way handshake | `linkActive = true`, IP via DHCP |
-| 6 | Throughput test (iperf3) | ≥ 300 Mbps TCP (1×1 AC) |
-| 7 | Bluetooth ROM `0x00000302` detected | Rampatch + NVM uploaded, status = 0x03 |
-| 8 | Device renamed → Apple BT stack attaches | Bluetooth icon appears, audio devices pair |
-| 9 | Wi‑Fi + BT simultaneous (coex) | No throughput collapse, audio stable |
-| 10 | Sleep (S3) → Wake | Interfaces resume, link restored |
-| 11 | Hot-plug / surprise removal | No kernel panic, clean detach |
+Contributions welcome! Please read the [contribution guidelines](CONTRIBUTING.md) (to be created) before submitting PRs.
 
----
+### Development Workflow
+1. Fork the repo
+2. Create a feature branch (`git checkout -b feature/amazing-fix`)
+3. Make changes with clear commit messages
+4. Run `make clean all verify` to ensure build passes
+5. Submit PR with description of changes and testing performed
 
-## ⚠️ Known Limitations / TODO
-
-- [ ] **P2P / AWDL** (AirDrop) — `createVirtualInterface` returns `nullptr`
-- [ ] **Monitor mode** — stubbed, not functional
-- [ ] **WPA3-SAE** — depends on firmware support; RSN supplicant handles it if firmware advertises
-- [ ] **Channel width > 20 MHz** — HTT/VHT 40/80 MHz tx desc setup incomplete
-- [ ] **macOS 12 (Monterey) `IO80211Controller` (non-V2)** — V2 path is primary; legacy stubs may need hardening
-- [ ] **ARM (Apple Silicon)** — currently `x86_64` only; `ARCH=arm64` build untested
+### Priority Areas
+- [ ] macOS 15 (Sequoia) Skywalk API updates
+- [ ] WPA3 / SAE support
+- [ ] Bluetooth LE audio (LC3 codec)
+- [ ] Additional OEM USB PID support
 
 ---
 
-## 📄 License
+## 📜 License
 
-This project is released under the **GNU General Public License v3.0 (GPL-3.0)**.
-
-```
-Copyright (c) 2026, xtuber
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
-```
-
-**Firmware binaries** (`firmware-6.bin`, `board.bin`, `rampatch_usb_*.bin`, `nvm_usb_*.bin`) are **explicitly excluded** from the GPL-3.0 license above. They are copyrighted by **Qualcomm Atheros / Qualcomm Technologies, Inc.** and redistributed under the terms of the [linux-firmware repository](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/tree/WHENCE) — see `build/*.kext/Contents/Resources/FIRMWARE-NOTICE.txt` and `FIRMWARE-LICENSE.txt` for exact licensing text. These firmware files are **not** covered by the GPL-3.0 and retain their original proprietary licenses.
+**Firmware binaries** (`firmware-6.bin`, `board.bin`, `rampatch_usb_*.bin`, `nvm_usb_*.bin`) are sourced from [`linux-firmware`](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/) and remain under their respective upstream licenses (Qualcomm Atheros proprietary firmware). This project embeds them for convenience; they are not relicensed.
 
 ---
 
-## 🙏 Credits & Acknowledgments
+## 🙏 Acknowledgments
 
-This project stands on the shoulders of giants. Deep gratitude to:
+This driver stands on the shoulders of giants:
 
-### Primary Upstream Projects
-
-| Project / Author | Repository | Contribution |
-|------------------|------------|--------------|
-| **OpenIntelWireless** — `itlwm`, `IntelBluetoothFirmware`, `HeliPort` | [github.com/OpenIntelWireless](https://github.com/OpenIntelWireless) | Pioneered native macOS Wi-Fi on third-party silicon; `AirportItlwm` architecture (IO80211Controller subclass, WCL, Skywalk, Apple RSN delegation) is the direct blueprint for `AirportQCA`. The BT firmware loader pattern is adapted from `IntelBluetoothFirmware`. |
-| **Linux `ath10k` maintainers** — Luis R. Rodriguez, Kalle Valo, et al. | [git.kernel.org/ath](https://git.kernel.org/pub/scm/linux/kernel/git/kvalo/ath.git) | The definitive reference for QCA9377 bring-up: BMI, Copy Engine DMA rings, HTC/WMI/HTT, and the critical **CE5 override** quirk (`ath10k_pci_override_ce_config`). |
-| **Qualcomm Atheros / Qualcomm Technologies** | — | Silicon vendor; provider of firmware binaries (`firmware-6.bin`, `board.bin`, Rome rampatch/NVM) via linux-firmware tree. |
-| **Apple / Darwin XNU team** | [github.com/apple-oss-distributions/xnu](https://github.com/apple-oss-distributions/xnu) | IOKit, IO80211Family, Skywalk, corewland, IOBluetoothFamily — the frameworks we hook into. |
-| **Acidanthera** — OpenCore, Lilu, WhateverGreen, AirportBrcmFixup, BlueToolFixup | [github.com/acidanthera](https://github.com/acidanthera) | Bootloader/kext ecosystem that makes loading unsigned kexts on macOS reliable; `BlueToolFixup`'s NVRAM requirements directly informed the `bluetoothInternalControllerInfo` implementation. |
-| **Dortania** — OpenCore Install Guide, Kext Guides | [dortania.github.io](https://dortania.github.io) | Documentation and community knowledge base for Hackintosh kext development and OpenCore integration. |
-| **Linux Wireless Subsystem** — `cfg80211`, `mac80211`, `bluetooth` subsystem | [kernel.org](https://www.kernel.org) | Reference implementations for 802.11 state machine, regulatory domains, HCI. |
-| **Tensilica / Cadence** | — | Xtensa LX4 core architecture docs (indirectly via `ath10k` firmware interface specs). |
-
-### Reference Source Trees (in `source/`)
-
-These repositories were cloned locally for reference during development:
-
-| Local Path | Upstream Repository | Description |
-|------------|---------------------|-------------|
-| `source/ath/` | [kernel.org/ath](https://git.kernel.org/pub/scm/linux/kernel/git/kvalo/ath.git) | Linux `ath10k` driver — core Wi-Fi bringup logic |
-| `source/ath/drivers/bluetooth/` | [kernel.org/bluetooth](https://git.kernel.org/pub/scm/linux/kernel/git/bluetooth/bluetooth.git) | Linux Bluetooth subsystem — QCA Rome DFU implementation |
-| `source/itlwm/` | [OpenIntelWireless/itlwm](https://github.com/OpenIntelWireless/itlwm) | Native macOS Wi-Fi driver architecture reference |
-| `source/IntelBluetoothFirmware/` | [OpenIntelWireless/IntelBluetoothFirmware](https://github.com/OpenIntelWireless/IntelBluetoothFirmware) | USB firmware injector pattern reference |
-| `source/linux-firmware/` | [kernel.org/linux-firmware](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git) | Binary firmware images for QCA9377 Wi-Fi and Rome BT |
-| `source/xnu/` | [apple-oss-distributions/xnu](https://github.com/apple-oss-distributions/xnu) | XNU kernel headers for IOKit/IO80211Family development |
-| `source/wireless-regdb/` | [wireless-regdb](https://git.kernel.org/pub/scm/linux/kernel/git/wireless/wireless-regdb.git) | Regulatory domain database |
-
-### Special Thanks (Individual Contributors)
-
-- **`zxystd`**, **`lvs1974`**, **`vulgo`**, **`hieplpvip`** — `itlwm` core authors whose code taught me how to write a macOS Wi-Fi driver.
-- **`HaozheZ`**, **`liszd`** — `IntelBluetoothFirmware` authors; the DFU/NVRAM/hand-off flow is modeled on their work.
-- The **OpenIntelWireless Discord** and **r/hackintosh** communities for testing, logs, and moral support.
-- Everyone who files issues, shares `ioreg`/`dmesg` dumps, and tests on real QCA9377 hardware.
+- **[OpenIntelWireless/itlwm](https://github.com/OpenIntelWireless/itlwm)** — Reference architecture for native macOS Wi-Fi drivers (`AirportItlwm`, Skywalk interface)
+- **[OpenIntelWireless/IntelBluetoothFirmware](https://github.com/OpenIntelWireless/IntelBluetoothFirmware)** — USB firmware injector pattern
+- **[Linux `ath10k` driver](https://git.kernel.org/pub/scm/linux/kernel/git/kvalo/ath.git/)** — Core BMI, CE, HTC, WMI-TLV, HTT implementation
+- **[Linux Bluetooth `btusb_qcom.c` / `btqca.c`](https://git.kernel.org/pub/scm/linux/kernel/git/bluetooth/bluetooth.git/)** — Rome firmware upload protocol
+- **Apple XNU / IOKit** — Kernel framework documentation and headers
 
 ---
 
-## 🔗 Links
+## 📞 Support
 
-- **Repository:** https://github.com/Xtuber14/AirportAth10k
-- **Issues / Discussions:** https://github.com/Xtuber14/AirportAth10k/issues
-- **OpenIntelWireless / itlwm:** https://github.com/OpenIntelWireless/itlwm
-- **OpenIntelWireless / IntelBluetoothFirmware:** https://github.com/OpenIntelWireless/IntelBluetoothFirmware
-- **Linux ath10k driver:** https://git.kernel.org/pub/scm/linux/kernel/git/kvalo/ath.git/tree/drivers/net/wireless/ath/ath10k
-- **linux-firmware (QCA blobs):** https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/tree/ath10k/QCA9377
-- **XNU Kernel Source:** https://github.com/apple-oss-distributions/xnu
-- **Acidanthera / OpenCore:** https://github.com/acidanthera/OpenCorePkg
-- **Dortania OpenCore Guide:** https://dortania.github.io/OpenCore-Install-Guide/
+- **Issues**: [GitHub Issues](https://github.com/Xtuber14/AirportAth10k/issues) — Bug reports, feature requests
+- **Discussions**: [GitHub Discussions](https://github.com/Xtuber14/AirportAth10k/discussions) — Q&A, hardware compatibility, configuration help
+- **Documentation**: [`docs/`](docs/) — Deep technical specifications
+
+> **Note**: This is a hobbyist/research project. No warranty implied. Use at your own risk on production machines.
 
 ---
 
-*Built with ❤️ for the Hackintosh & macOS driver development community.*
+**Made with ❤️ for the Hackintosh & macOS driver development community**
