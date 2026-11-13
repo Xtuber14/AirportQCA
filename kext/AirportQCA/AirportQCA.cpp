@@ -649,11 +649,10 @@ SInt32 AirportQCA::dispatchApple80211Request(unsigned int request_type, int requ
 
         case APPLE80211_IOC_ASSOCIATE: {
             qca_info("apple80211Request: ASSOCIATE");
-            if (data && fHalDevice) {
-                auto *assoc = (apple80211_assoc_data*)data;
-                static_cast<QCAPCIDevice*>(fHalDevice)->associate(assoc);
-            }
-            return kIOReturnSuccess;
+            if (!data || !fHalDevice) return kIOReturnNotReady;
+            return static_cast<QCAPCIDevice*>(fHalDevice)->associate(
+                (apple80211_assoc_data*)data, fChannel) == 0
+                ? kIOReturnSuccess : kIOReturnIOError;
         }
 
         case APPLE80211_IOC_DISASSOCIATE: {

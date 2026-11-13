@@ -54,7 +54,7 @@ public:
     /* Wi-Fi Control & Data Operations */
     void setChannel(uint32_t channel);
     int startScan();
-    void associate(apple80211_assoc_data *assoc);
+    int associate(apple80211_assoc_data *assoc, u32 channel);
     void disassociate();
     void installKey(apple80211_key *key);
     UInt32 transmitPacket(mbuf_t m);

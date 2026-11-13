@@ -271,10 +271,10 @@ void QCAPCIDevice::getMacAddress(uint8_t *mac)
 
 void QCAPCIDevice::setChannel(uint32_t channel)
 {
-    if (fWmi) {
-        u32 width = (channel > 14) ? 80 : 20; /* 80 MHz for 5GHz, 20 MHz for 2.4GHz */
-        fWmi->startVdev(0, channel, width);
-    }
+    /* The channel ioctl records the selected channel in AirportQCA. Start the
+     * station VDEV only when association supplies its SSID and BSSID; starting
+     * it here leaves firmware in a started state before a real join request. */
+    qca_info("Selected channel %u; firmware VDEV will start during association", channel);
 }
 
 int QCAPCIDevice::startScan()
@@ -282,12 +282,15 @@ int QCAPCIDevice::startScan()
     return fWmi ? fWmi->startScan(0) : kIOReturnNotReady;
 }
 
-void QCAPCIDevice::associate(apple80211_assoc_data *assoc)
+int QCAPCIDevice::associate(apple80211_assoc_data *assoc, u32 channel)
 {
-    if (fWmi && assoc) {
-        fWmi->createPeer(0, assoc->ad_bssid.octet);
-        fWmi->associatePeer(0, assoc->ad_bssid.octet, assoc);
-    }
+    if (!fWmi || !assoc || !channel) return kIOReturnBadArgument;
+    const u32 width = channel > 14 ? 80 : 20;
+    int result = fWmi->startVdev(0, channel, width, assoc->ad_ssid, assoc->ad_ssid_len);
+    if (result != 0) return result;
+    result = fWmi->createPeer(0, assoc->ad_bssid.octet);
+    if (result != 0) return result;
+    return fWmi->associatePeer(0, assoc->ad_bssid.octet, assoc);
 }
 
 void QCAPCIDevice::disassociate()

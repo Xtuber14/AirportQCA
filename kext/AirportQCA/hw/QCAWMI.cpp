@@ -412,14 +412,18 @@ int QCAWMI::createVdev(u32 vdevId, const u8 *mac)
     return sendWmiCmd(WMI_VDEV_CREATE_CMDID, tlv, offset);
 }
 
-int QCAWMI::startVdev(u32 vdevId, u32 channel, u32 chWidth)
+int QCAWMI::startVdev(u32 vdevId, u32 channel, u32 chWidth,
+                      const u8 *ssid, u32 ssidLength)
 {
     qca_info("WMI: starting VDEV %u on channel %u (width %u MHz)", vdevId, channel, chWidth);
-    if (!channel || channel > 196) return -1;
+    if (!channel || channel > 196 || ssidLength > 32 ||
+        (ssidLength && !ssid)) return -1;
     WmiVdevStart cmd = {};
     cmd.vdevId = cpu_to_le32(vdevId);
     cmd.beaconInterval = cpu_to_le32(100);
     cmd.dtimPeriod = cpu_to_le32(1);
+    cmd.ssid.length = cpu_to_le32(ssidLength);
+    if (ssidLength) memcpy(cmd.ssid.bytes, ssid, ssidLength);
     WmiChannel chan = {};
     u32 frequency = channel <= 13 ? 2407 + channel * 5 : (channel == 14 ? 2484 : 5000 + channel * 5);
     u32 mode;

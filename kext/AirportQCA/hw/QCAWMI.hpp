@@ -51,7 +51,8 @@ public:
     int waitReady(u8 mac[6]);
     void pollEvents();
     int createVdev(u32 vdevId, const u8 *mac);
-    int startVdev(u32 vdevId, u32 channel, u32 chWidth);
+    int startVdev(u32 vdevId, u32 channel, u32 chWidth,
+                  const u8 *ssid = nullptr, u32 ssidLength = 0);
     int stopVdev(u32 vdevId);
     int startScan(u32 scanType);
     int createPeer(u32 vdevId, const u8 *peerMac);
