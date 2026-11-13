@@ -28,6 +28,8 @@ static const u16 TAG_STRUCT_PEER_CREATE = 97;
 static const u16 TAG_STRUCT_PEER_ASSOC = 101;
 static const u16 TAG_STRUCT_VHT_RATE_SET = 102;
 static const u16 TAG_STRUCT_INSTALL_KEY = 96;
+/* ath10k enum ath10k_hw_txrx_mode: RAW=0, NATIVE_WIFI=1, ETHERNET=2. */
+static const u32 WMI_RX_DECAP_NATIVE_WIFI = 1;
 static const u16 WMI_EVENT_SERVICE_READY = 1;
 static const u16 WMI_EVENT_READY = 2;
 static const u32 WMI_TLV_ABI_VER0 = 0x01000000;
@@ -317,6 +319,7 @@ int QCAWMI::sendInitCmd()
     cfg.astSkid = cpu_to_le32(0x10);
     cfg.txChainMask = cpu_to_le32(1);
     cfg.rxChainMask = cpu_to_le32(1);
+    cfg.rxDecap = cpu_to_le32(WMI_RX_DECAP_NATIVE_WIFI);
     for (unsigned i = 0; i < 3; ++i) cfg.rxTimeout[i] = cpu_to_le32(0x64);
     cfg.rxTimeout[3] = cpu_to_le32(0x28);
     cfg.scanPending = cpu_to_le32(4);
