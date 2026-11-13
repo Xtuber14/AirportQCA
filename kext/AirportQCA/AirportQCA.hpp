@@ -57,7 +57,8 @@ public:
 #endif
 
     virtual UInt32 outputPacket(mbuf_t m, void *param) APPLE_KEXT_OVERRIDE;
-    SInt32 dispatchApple80211Request(unsigned int requestType, int requestNumber, void *data);
+    SInt32 dispatchApple80211Request(unsigned int requestType, int requestNumber, void *data,
+                                     UInt32 requestedChannel = 0);
 #ifndef IO80211FAMILY_V2
     virtual int outputRaw80211Packet(IO80211Interface *interface, mbuf_t m) APPLE_KEXT_OVERRIDE;
     virtual bool useAppleRSNSupplicant(IO80211Interface *interface) APPLE_KEXT_OVERRIDE;

@@ -87,12 +87,22 @@ IOReturn AirportQCAInterface::setWCL_ASSOCIATE(apple80211AssocCandidates *reques
     AirportWCL::JoinRequest decoded;
     if (!AirportWCL::decodeJoin(request, 0x2cc, decoded)) return kIOReturnBadArgument;
     if (!fDriver) return kIOReturnNotReady;
+    if (AirportWCL::classifyLegacyAuth(decoded) == AirportWCL::LegacyAuth::Invalid)
+        return kIOReturnUnsupported;
+
+    const UInt32 candidateChannel = decoded.channelSpec & 0x00ff;
+    const UInt16 band = decoded.channelSpec & 0xf000;
+    if (candidateChannel &&
+        ((band != 0x1000 && band != 0xd000) ||
+         (band == 0x1000 && candidateChannel > 14) ||
+         (band == 0xd000 && (candidateChannel <= 14 || candidateChannel > 196))))
+        return kIOReturnBadArgument;
 
     apple80211_assoc_data association = {};
     association.version = APPLE80211_VERSION;
     association.ad_mode = APPLE80211_M_STA;
-    association.ad_auth_lower = decoded.lowerAuth;
-    association.ad_auth_upper = decoded.upperAuth;
+    association.ad_auth_lower = static_cast<uint16_t>(decoded.lowerAuth);
+    association.ad_auth_upper = static_cast<uint16_t>(decoded.upperAuth);
     association.ad_ssid_len = decoded.ssidLength;
     memcpy(association.ad_ssid, decoded.ssid, decoded.ssidLength);
     memcpy(association.ad_bssid.octet, decoded.bssid, sizeof(decoded.bssid));
@@ -103,5 +113,6 @@ IOReturn AirportQCAInterface::setWCL_ASSOCIATE(apple80211AssocCandidates *reques
     memcpy(association.ad_key.key, decoded.key, decoded.keyLength);
     association.ad_rsn_ie_len = decoded.rsnLength;
     memcpy(association.ad_rsn_ie, decoded.rsn, decoded.rsnLength);
-    return fDriver->dispatchApple80211Request(SIOCSA80211, APPLE80211_IOC_ASSOCIATE, &association);
+    return fDriver->dispatchApple80211Request(SIOCSA80211, APPLE80211_IOC_ASSOCIATE,
+                                               &association, candidateChannel);
 }

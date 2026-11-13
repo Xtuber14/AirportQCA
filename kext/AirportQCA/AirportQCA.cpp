@@ -381,7 +381,8 @@ bool AirportQCA::useAppleRSNSupplicant(IO80211Interface *interface)
 }
 #endif
 
-SInt32 AirportQCA::dispatchApple80211Request(unsigned int request_type, int request_number, void *data)
+SInt32 AirportQCA::dispatchApple80211Request(unsigned int request_type, int request_number,
+                                             void *data, UInt32 requestedChannel)
 {
     if (request_type != SIOCGA80211 && request_type != SIOCSA80211) {
         return kIOReturnError;
@@ -653,7 +654,7 @@ SInt32 AirportQCA::dispatchApple80211Request(unsigned int request_type, int requ
             qca_info("apple80211Request: ASSOCIATE");
             if (!data || !fHalDevice) return kIOReturnNotReady;
             return static_cast<QCAPCIDevice*>(fHalDevice)->associate(
-                (apple80211_assoc_data*)data, fChannel) == 0
+                (apple80211_assoc_data*)data, requestedChannel ? requestedChannel : fChannel) == 0
                 ? kIOReturnSuccess : kIOReturnIOError;
         }
 
