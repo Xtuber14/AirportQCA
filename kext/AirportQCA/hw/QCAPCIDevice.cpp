@@ -235,7 +235,10 @@ bool QCAPCIDevice::bootFirmware()
         qca_err("WMI-TLV service-ready/init/ready handshake failed");
         return false;
     }
-    fHtt->init();
+    if (!fHtt->init()) {
+        qca_err("HTT version negotiation/RX ring setup failed");
+        return false;
+    }
 
     fFwRunning = true;
     qca_info("QCA9377 firmware boot completed successfully");

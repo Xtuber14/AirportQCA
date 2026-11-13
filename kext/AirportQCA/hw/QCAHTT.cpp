@@ -15,9 +15,61 @@ static const u32 HTT_TX_PEER_INVALID = 0xFFFF;
 static const u32 HTT_TX_PREFETCH_BYTES = 128;
 static const u32 HTT_DESC_MAC_HEADER_PRESENT = 1U << 0;
 static const u32 HTT_DESC_POSTPONED = 1U << 11;
-static_assert(sizeof(htt_tx_buffer) == 40, "ath10k QCA9377 HTT TX buffer ABI mismatch");
+static const u32 HTT_RX_RING_SIZE = 2048;
+static const u32 HTT_RX_RING_FILL_LEVEL = (HTT_RX_RING_SIZE / 2) - 1;
+static const u32 HTT_RX_BUFFER_SIZE = 2048;
+static const u16 HTT_RX_RING_FLAGS = 0xFFFF;
 
-QCAHTT::QCAHTT(QCAPCIDevice *pci) : fPci(pci), fNextMsduId(0), fLock(IOLockAlloc())
+static IOBufferMemoryDescriptor *allocatePreparedDMA(size_t length)
+{
+    IOBufferMemoryDescriptor *memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, kIODirectionInOut | kIOMemoryHostPhysicallyContiguous,
+        length, 0x00000000FFFFFFFFULL);
+    if (!memory) return nullptr;
+    if (memory->prepare() != kIOReturnSuccess) {
+        memory->release();
+        return nullptr;
+    }
+    return memory;
+}
+
+struct __attribute__((packed)) htt_rx_desc_offsets32 {
+    __le16 mac80211Header;
+    __le16 msduPayload;
+    __le16 ppduStart;
+    __le16 ppduEnd;
+    __le16 mpduStart;
+    __le16 mpduEnd;
+    __le16 msduStart;
+    __le16 msduEnd;
+    __le16 attention;
+    __le16 fragInfo;
+};
+struct __attribute__((packed)) htt_rx_ring32 {
+    __le32 fwIndexAddress;
+    __le32 ringAddress;
+    __le16 ringLength;
+    __le16 bufferSize;
+    __le16 flags;
+    __le16 initialIndex;
+    htt_rx_desc_offsets32 offsets;
+};
+struct __attribute__((packed)) htt_rx_ring_setup32 {
+    u8 ringCount;
+    __le16 reserved;
+    htt_rx_ring32 ring;
+};
+struct __attribute__((packed)) htt_rx_ring_command32 {
+    u8 messageType;
+    htt_rx_ring_setup32 setup;
+};
+static_assert(sizeof(htt_tx_buffer) == 40, "ath10k QCA9377 HTT TX buffer ABI mismatch");
+static_assert(sizeof(htt_rx_ring32) == 36, "ath10k QCA9377 HTT RX ring ABI mismatch");
+static_assert(sizeof(htt_rx_ring_command32) == 40, "ath10k QCA9377 HTT RX setup ABI mismatch");
+
+QCAHTT::QCAHTT(QCAPCIDevice *pci)
+    : fPci(pci), fNextMsduId(0), fLock(IOLockAlloc()), fRxRingMemory(nullptr),
+      fRxBufferMemory(nullptr), fRxIndexMemory(nullptr), fRxFillIndex(0)
 {
     memset(fPending, 0, sizeof(fPending));
 }
@@ -37,12 +89,103 @@ QCAHTT::~QCAHTT()
         IOLockFree(fLock);
         fLock = nullptr;
     }
+    if (fRxRingMemory) { fRxRingMemory->complete(); fRxRingMemory->release(); fRxRingMemory = nullptr; }
+    if (fRxBufferMemory) { fRxBufferMemory->complete(); fRxBufferMemory->release(); fRxBufferMemory = nullptr; }
+    if (fRxIndexMemory) { fRxIndexMemory->complete(); fRxIndexMemory->release(); fRxIndexMemory = nullptr; }
 }
 
 bool QCAHTT::init()
 {
     if (!fLock) return false;
-    qca_info("Initializing QCA9377 HTT 32-bit data plane");
+    QCACopyEngine *ce = fPci->getCopyEngine();
+    QCAHTC *htc = fPci->getHTC();
+    if (!ce || !htc) return false;
+
+    /* Negotiate the HTT ABI before submitting setup commands. */
+    const u8 versionRequest[4] = { 0, 0, 0, 0 };
+    if (htc->send(ATH10K_HTC_EP_2, (void *)versionRequest, sizeof(versionRequest)) != 0) {
+        qca_err("Unable to send HTT version request");
+        return false;
+    }
+    bool versionReceived = false;
+    u8 response[64];
+    for (u32 retry = 0; retry < 3000 && !versionReceived; ++retry) {
+        u32 length = sizeof(response);
+        if (ce->recv(5, response, &length) == 0) {
+            if (length < sizeof(ath10k_htc_hdr) + 4) continue;
+            const auto *transport = (const ath10k_htc_hdr *)response;
+            const u8 *payload = response + sizeof(*transport);
+            if (transport->eid != ATH10K_HTC_EP_2 || payload[0] != 0) continue;
+            const u8 major = payload[2];
+            if (major != 2 && major != 3) {
+                qca_err("Unsupported HTT target version %u.%u", major, payload[1]);
+                return false;
+            }
+            versionReceived = true;
+            qca_info("HTT target protocol version %u.%u", major, payload[1]);
+        } else {
+            qca_mdelay(1);
+        }
+    }
+    if (!versionReceived) {
+        qca_err("Timed out waiting for HTT version response");
+        return false;
+    }
+
+    const u32 ringBytes = HTT_RX_RING_SIZE * sizeof(__le32);
+    const u32 bufferBytes = HTT_RX_RING_SIZE * HTT_RX_BUFFER_SIZE;
+    fRxRingMemory = allocatePreparedDMA(ringBytes);
+    fRxBufferMemory = allocatePreparedDMA(bufferBytes);
+    fRxIndexMemory = allocatePreparedDMA(sizeof(__le32));
+    if (!fRxRingMemory || !fRxBufferMemory || !fRxIndexMemory) {
+        qca_err("Unable to allocate/prepare 32-bit HTT RX DMA memory");
+        return false;
+    }
+    const u64 ringPaddr = fRxRingMemory->getPhysicalAddress();
+    const u64 buffersPaddr = fRxBufferMemory->getPhysicalAddress();
+    const u64 indexPaddr = fRxIndexMemory->getPhysicalAddress();
+    if (!fRxRingMemory->getBytesNoCopy() || !fRxBufferMemory->getBytesNoCopy() ||
+        !fRxIndexMemory->getBytesNoCopy() || ringPaddr + ringBytes > 0x100000000ULL ||
+        buffersPaddr + bufferBytes > 0x100000000ULL || indexPaddr + sizeof(__le32) > 0x100000000ULL) {
+        qca_err("HTT RX DMA allocation is outside the QCA9377 32-bit address window");
+        return false;
+    }
+    auto *ring = (volatile __le32 *)fRxRingMemory->getBytesNoCopy();
+    memset((void *)ring, 0, ringBytes);
+    for (u32 i = 0; i < HTT_RX_RING_FILL_LEVEL; ++i) {
+        ring[i] = cpu_to_le32((u32)(buffersPaddr + (u64)i * HTT_RX_BUFFER_SIZE));
+    }
+    auto *index = (__le32 *)fRxIndexMemory->getBytesNoCopy();
+    *index = cpu_to_le32(HTT_RX_RING_FILL_LEVEL);
+    fRxFillIndex = HTT_RX_RING_FILL_LEVEL;
+
+    htt_rx_ring_command32 command = {};
+    command.messageType = 2; /* HTT_H2T_MSG_TYPE_RX_RING_CFG */
+    command.setup.ringCount = 1;
+    command.setup.ring.fwIndexAddress = cpu_to_le32((u32)indexPaddr);
+    command.setup.ring.ringAddress = cpu_to_le32((u32)ringPaddr);
+    command.setup.ring.ringLength = cpu_to_le16(HTT_RX_RING_SIZE);
+    command.setup.ring.bufferSize = cpu_to_le16(HTT_RX_BUFFER_SIZE);
+    command.setup.ring.flags = cpu_to_le16(HTT_RX_RING_FLAGS);
+    command.setup.ring.initialIndex = cpu_to_le16((u16)fRxFillIndex);
+    /* QCA988x/QCA9377 htt_rx_desc_v1 offsets from ath10k rx_desc.h. */
+    command.setup.ring.offsets.mac80211Header = cpu_to_le16(59);
+    command.setup.ring.offsets.msduPayload = cpu_to_le16(75);
+    command.setup.ring.offsets.ppduStart = cpu_to_le16(21);
+    command.setup.ring.offsets.ppduEnd = cpu_to_le16(31);
+    command.setup.ring.offsets.mpduStart = cpu_to_le16(3);
+    command.setup.ring.offsets.mpduEnd = cpu_to_le16(20);
+    command.setup.ring.offsets.msduStart = cpu_to_le16(6);
+    command.setup.ring.offsets.msduEnd = cpu_to_le16(10);
+    command.setup.ring.offsets.attention = cpu_to_le16(1);
+    command.setup.ring.offsets.fragInfo = cpu_to_le16(2);
+    OSSynchronizeIO();
+    if (htc->send(ATH10K_HTC_EP_2, &command, sizeof(command)) != 0) {
+        qca_err("Unable to configure QCA9377 HTT RX ring");
+        return false;
+    }
+    qca_info("Configured QCA9377 HTT RX ring: %u entries, %u initially posted",
+             HTT_RX_RING_SIZE, HTT_RX_RING_FILL_LEVEL);
     return true;
 }
 

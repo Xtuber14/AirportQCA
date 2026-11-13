@@ -51,6 +51,10 @@ private:
     u16 fNextMsduId;
     IOLock *fLock;
     IOBufferMemoryDescriptor *fPending[256];
+    IOBufferMemoryDescriptor *fRxRingMemory;
+    IOBufferMemoryDescriptor *fRxBufferMemory;
+    IOBufferMemoryDescriptor *fRxIndexMemory;
+    u32 fRxFillIndex;
 };
 
 #endif /* _QCA_HTT_HPP_ */
