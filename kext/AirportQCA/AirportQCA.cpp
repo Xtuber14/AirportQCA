@@ -379,7 +379,7 @@ bool AirportQCA::useAppleRSNSupplicant(IO80211Interface *interface)
     /* Delegate 802.1X / WPA2-PSK 4-way handshake to macOS native corewland */
     return true;
 }
-
+#endif
 
 SInt32 AirportQCA::dispatchApple80211Request(unsigned int request_type, int request_number, void *data)
 {
@@ -690,9 +690,6 @@ SInt32 AirportQCA::dispatchApple80211Request(unsigned int request_type, int requ
 
     return kIOReturnSuccess;
 }
-
-#endif
-
 
 #ifndef IO80211FAMILY_V2
 SInt32 AirportQCA::apple80211Request(unsigned int type, int number, IO80211Interface *, void *data)
