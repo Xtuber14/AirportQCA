@@ -33,9 +33,9 @@
 			<key>IOProviderClass</key>
 			<string>IOUSBHostDevice</string>
 			<key>idProduct</key>
-			<integer>58112</integer> <!-- 0xE300 -->
+			<integer>58112</integer>
 			<key>idVendor</key>
-			<integer>3315</integer>  <!-- 0x0CF3 -->
+			<integer>3315</integer>
 		</dict>
 		<key>QCABluetooth_0489_e0a2</key>
 		<dict>
@@ -50,9 +50,9 @@
 			<key>IOProviderClass</key>
 			<string>IOUSBHostDevice</string>
 			<key>idProduct</key>
-			<integer>57506</integer> <!-- 0xE0A2 -->
+			<integer>57506</integer>
 			<key>idVendor</key>
-			<integer>1161</integer>  <!-- 0x0489 -->
+			<integer>1161</integer>
 		</dict>
 		<key>QCABluetooth_04ca_3015</key>
 		<dict>
@@ -67,9 +67,9 @@
 			<key>IOProviderClass</key>
 			<string>IOUSBHostDevice</string>
 			<key>idProduct</key>
-			<integer>12309</integer> <!-- 0x3015 -->
+			<integer>12309</integer>
 			<key>idVendor</key>
-			<integer>1226</integer>  <!-- 0x04CA -->
+			<integer>1226</integer>
 		</dict>
 		<key>QCABluetooth_13d3_3496</key>
 		<dict>
@@ -84,9 +84,9 @@
 			<key>IOProviderClass</key>
 			<string>IOUSBHostDevice</string>
 			<key>idProduct</key>
-			<integer>13462</integer> <!-- 0x3496 -->
+			<integer>13462</integer>
 			<key>idVendor</key>
-			<integer>5075</integer>  <!-- 0x13D3 -->
+			<integer>5075</integer>
 		</dict>
 	</dict>
 	<key>NSHumanReadableCopyright</key>
@@ -96,11 +96,11 @@
 		<key>com.apple.iokit.IOUSBHostFamily</key>
 		<string>1.2</string>
 		<key>com.apple.kpi.iokit</key>
-		<string>16.7</string>
+		<string>16.0.0</string>
 		<key>com.apple.kpi.libkern</key>
-		<string>16.7</string>
+		<string>16.0.0</string>
 		<key>com.apple.kpi.mach</key>
-		<string>16.7</string>
+		<string>16.0.0</string>
 	</dict>
 	<key>OSBundleRequired</key>
 	<string>Root</string>

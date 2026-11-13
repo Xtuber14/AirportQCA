@@ -12,35 +12,45 @@ CXX     := clang++
 ARCH    := x86_64
 
 # Strict Kernel Flags (Prevents any user-space library conflict)
-KERNEL_FLAGS := \
+KERNEL_COMMON_FLAGS := \
 	-mkernel \
 	-arch $(ARCH) \
+	-mmacosx-version-min=10.15 \
 	-isysroot $(SDKROOT) \
 	-I$(SDKROOT)/System/Library/Frameworks/Kernel.framework/Headers \
 	-I$(SDKROOT)/System/Library/Frameworks/Kernel.framework/PrivateHeaders \
 	-fno-builtin \
 	-fno-common \
 	-fno-exceptions \
-	-fno-rtti \
-	-nostdinc++ \
 	-fno-stack-protector \
 	-mno-red-zone \
 	-fstrict-aliasing \
 	-DKERNEL \
 	-D__APPLE__ \
 	-D__IO80211_TARGET=12 \
-	-std=c++14 \
 	-Wall -Wextra -Wno-unused-parameter \
-	-Wno-deprecated-declarations \
+	-Wno-deprecated-declarations
+
+KERNEL_CFLAGS := \
+	$(KERNEL_COMMON_FLAGS) \
+	-std=gnu99
+
+KERNEL_CXXFLAGS := \
+	$(KERNEL_COMMON_FLAGS) \
+	-std=c++14 \
+	-fno-rtti \
+	-nostdinc++ \
 	-Wno-inconsistent-missing-override
 
 # Linker flags for pure Mach-O 64-bit KEXT bundle
 LDFLAGS := \
 	-mkernel \
 	-arch $(ARCH) \
+	-mmacosx-version-min=10.15 \
 	-isysroot $(SDKROOT) \
 	-nostdlib \
 	-Xlinker -kext \
+	-Wl,-w \
 	-lkmod
 
 BUILD_DIR := ../build
@@ -48,6 +58,7 @@ AIRPORT_DIR := AirportQCA
 BT_DIR := QCABluetooth
 
 AIRPORT_SRCS := \
+	$(AIRPORT_DIR)/AirportQCA_info.c \
 	$(AIRPORT_DIR)/AirportQCA.cpp \
 	$(AIRPORT_DIR)/AirportQCAInterface.cpp \
 	$(AIRPORT_DIR)/hw/QCAPCIDevice.cpp \
@@ -57,13 +68,14 @@ AIRPORT_SRCS := \
 	$(AIRPORT_DIR)/hw/QCAWMI.cpp \
 	$(AIRPORT_DIR)/hw/QCAHTT.cpp
 
-AIRPORT_OBJS := $(patsubst %.cpp, $(BUILD_DIR)/%.o, $(AIRPORT_SRCS))
+AIRPORT_OBJS := $(patsubst %.cpp, $(BUILD_DIR)/%.o, $(patsubst %.c, $(BUILD_DIR)/%.o, $(AIRPORT_SRCS)))
 
 BT_SRCS := \
+	$(BT_DIR)/QCABluetooth_info.c \
 	$(BT_DIR)/QCABluetoothFirmware.cpp \
 	$(BT_DIR)/QCAUSBController.cpp
 
-BT_OBJS := $(patsubst %.cpp, $(BUILD_DIR)/%.o, $(BT_SRCS))
+BT_OBJS := $(patsubst %.cpp, $(BUILD_DIR)/%.o, $(patsubst %.c, $(BUILD_DIR)/%.o, $(BT_SRCS)))
 
 AIRPORT_KEXT := $(BUILD_DIR)/AirportQCA.kext
 BT_KEXT := $(BUILD_DIR)/QCABluetoothFirmware.kext
@@ -88,7 +100,11 @@ $(AIRPORT_KEXT): $(AIRPORT_OBJS)
 
 $(BUILD_DIR)/$(AIRPORT_DIR)/%.o: $(AIRPORT_DIR)/%.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(KERNEL_FLAGS) -I$(AIRPORT_DIR) -I$(AIRPORT_DIR)/include -I$(AIRPORT_DIR)/include/Apple80211 -c $< -o $@
+	$(CXX) $(KERNEL_CXXFLAGS) -I$(AIRPORT_DIR) -I$(AIRPORT_DIR)/include -I$(AIRPORT_DIR)/include/Apple80211 -c $< -o $@
+
+$(BUILD_DIR)/$(AIRPORT_DIR)/%.o: $(AIRPORT_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -I$(AIRPORT_DIR) -I$(AIRPORT_DIR)/include -c $< -o $@
 
 # -------------------------------------------------------------
 # QCABluetoothFirmware.kext
@@ -106,7 +122,11 @@ $(BT_KEXT): $(BT_OBJS)
 
 $(BUILD_DIR)/$(BT_DIR)/%.o: $(BT_DIR)/%.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(KERNEL_FLAGS) -I$(BT_DIR) -c $< -o $@
+	$(CXX) $(KERNEL_CXXFLAGS) -I$(BT_DIR) -c $< -o $@
+
+$(BUILD_DIR)/$(BT_DIR)/%.o: $(BT_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -I$(BT_DIR) -c $< -o $@
 
 # -------------------------------------------------------------
 # Verification against OpenCore requirements
