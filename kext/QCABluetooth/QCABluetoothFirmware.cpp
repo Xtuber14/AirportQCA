@@ -45,6 +45,11 @@ IOService* QCABluetoothFirmware::probe(IOService *provider, SInt32 *score)
         return nullptr;
     }
 
+    const char *devName = dev->getName();
+    if (devName && strcmp(devName, "Bluetooth USB Host Controller") == 0) {
+        return nullptr;
+    }
+
     *score += 5000;
     IOLog("QCABluetoothFirmware: matched Qualcomm Rome Bluetooth USB device\n");
     return this;
@@ -75,6 +80,12 @@ bool QCABluetoothFirmware::start(IOService *provider)
 
     bool success = uploadFirmware();
     publishProperties(success);
+
+    /* Clean up controller instance */
+    if (fUsbController) {
+        fUsbController->release();
+        fUsbController = nullptr;
+    }
 
     /* Handoff: close device so Apple's native Bluetooth stack can claim it */
     fDevice->close(this);
@@ -107,7 +118,17 @@ bool QCABluetoothFirmware::uploadFirmware()
 
     /* Query status to determine if patch is required */
     uint8_t status = 0;
-    fUsbController->sendVendorRequestIn(QCA_CHECK_STATUS, &status, sizeof(status));
+    ret = fUsbController->sendVendorRequestIn(QCA_CHECK_STATUS, &status, sizeof(status));
+    if (ret != kIOReturnSuccess) {
+        IOLog("QCABluetoothFirmware: failed to query status (0x%08x)\n", ret);
+        return false;
+    }
+
+    /* If both rampatch and syscfg are already updated, skip downloading */
+    if ((status & (QCA_PATCH_UPDATED | QCA_SYSCFG_UPDATED)) == (QCA_PATCH_UPDATED | QCA_SYSCFG_UPDATED)) {
+        IOLog("QCABluetoothFirmware: ROM already patched (status=0x%02x), skipping upload\n", status);
+        return true;
+    }
 
     if (!(status & QCA_PATCH_UPDATED)) {
         IOLog("QCABluetoothFirmware: downloading rampatch_usb_00000302.bin\n");
@@ -119,9 +140,12 @@ bool QCABluetoothFirmware::uploadFirmware()
         /* In production, NVM table is streamed */
     }
 
-    /* Reset controller to apply firmware */
-    fUsbController->resetController();
-    IODelay(100000); /* 100 ms wait for reset completion */
+    /*
+     * Note: Rome 3.2 (0x00000302) executes the rampatch directly in RAM without
+     * issuing an IOUSBHostDevice::reset(). Hardware USB bus resets trigger root hub
+     * disconnects and infinite boot loops.
+     */
+    IODelay(10000); /* 10 ms wait for firmware execution transition */
 
     return true;
 }

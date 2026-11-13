@@ -93,9 +93,13 @@ IOReturn QCAUSBController::bulkWrite(const void *data, uint32_t length, uint32_t
 
 bool QCAUSBController::resetController()
 {
-    if (fDevice) {
-        fDevice->reset();
-        return true;
-    }
-    return false;
+    /*
+     * For Qualcomm Rome 3.2 (QCA9377), do NOT call fDevice->reset().
+     * An IOUSBHostDevice hardware reset drops the USB physical connection,
+     * causes re-enumeration on the USB root hub, destroys IOKit state,
+     * and forces an infinite boot loop.
+     * The Rome controller transitions into the patched execution state
+     * autonomously after the NVM download completes.
+     */
+    return true;
 }

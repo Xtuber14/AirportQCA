@@ -96,11 +96,11 @@
 		<key>com.apple.iokit.IOUSBHostFamily</key>
 		<string>1.2</string>
 		<key>com.apple.kpi.iokit</key>
-		<string>16.0.0</string>
+		<string>16.7</string>
 		<key>com.apple.kpi.libkern</key>
-		<string>16.0.0</string>
+		<string>16.7</string>
 		<key>com.apple.kpi.mach</key>
-		<string>16.0.0</string>
+		<string>16.7</string>
 	</dict>
 	<key>OSBundleRequired</key>
 	<string>Root</string>
