@@ -21,7 +21,8 @@ public:
     int getTargetInfo(struct bmi_target_info *info);
     int writeMem(u32 address, const void *data, u32 length);
     int readMem(u32 address, void *data, u32 length);
-    int execute(u32 address, u32 param);
+    int fastDownload(u32 address, const void *data, u32 length);
+    int execute(u32 address, u32 param, u32 *result = nullptr);
     int setAppStart(u32 address);
     int writeSocRegister(u32 address, u32 value);
     int done();

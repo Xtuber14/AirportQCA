@@ -7,6 +7,8 @@
 #include "QCAPCIDevice.hpp"
 #include "QCACopyEngine.hpp"
 
+static const u32 BMI_MAX_MSG = 256;
+
 QCABMI::QCABMI(QCAPCIDevice *pci)
     : fPci(pci), fDoneSent(false)
 {
@@ -81,12 +83,13 @@ int QCABMI::writeMem(u32 address, const void *data, u32 length)
     if (!data || length == 0) return -1;
 
     /* BMI write command header: cmd, address, length followed by data */
-    u8 buffer[512];
+    u8 buffer[BMI_MAX_MSG];
     u32 maxChunk = sizeof(buffer) - 12;
     u32 offset = 0;
 
     while (offset < length) {
-        u32 chunk = min(length - offset, maxChunk);
+        u32 remaining = length - offset;
+        u32 chunk = remaining < maxChunk ? remaining : maxChunk;
 
         __le32 *hdr = (__le32*)buffer;
         hdr[0] = cpu_to_le32(BMI_WRITE_MEM);
@@ -107,10 +110,54 @@ int QCABMI::writeMem(u32 address, const void *data, u32 length)
 
 int QCABMI::readMem(u32 address, void *data, u32 length)
 {
+    if (!data || !length) return -1;
+    u8 *out = (u8 *)data;
+    while (length) {
+        u32 chunk = length > 240 ? 240 : length;
+        __le32 req[3] = { cpu_to_le32(BMI_READ_MEM), cpu_to_le32(address), cpu_to_le32(chunk) };
+        u32 responseLen = chunk;
+        if (exchangeMessage(req, sizeof(req), out, &responseLen) != 0 || responseLen != chunk)
+            return -1;
+        address += chunk;
+        out += chunk;
+        length -= chunk;
+    }
     return 0;
 }
 
-int QCABMI::execute(u32 address, u32 param)
+int QCABMI::fastDownload(u32 address, const void *data, u32 length)
+{
+    if (!data || !length) return -1;
+    __le32 start[2] = { cpu_to_le32(13), cpu_to_le32(address) }; /* BMI_LZ_STREAM_START */
+    if (exchangeMessage(start, sizeof(start), nullptr, nullptr) != 0) return -1;
+    const u8 *bytes = (const u8 *)data;
+    u32 aligned = length & ~3U;
+    u32 offset = 0;
+    while (offset < aligned) {
+        u32 chunk = aligned - offset;
+        if (chunk > BMI_MAX_MSG - 8) chunk = BMI_MAX_MSG - 8;
+        chunk &= ~3U;
+        u8 msg[BMI_MAX_MSG];
+        __le32 *hdr = (__le32 *)msg;
+        hdr[0] = cpu_to_le32(14); /* BMI_LZ_DATA */
+        hdr[1] = cpu_to_le32(chunk);
+        memcpy(msg + 8, bytes + offset, chunk);
+        if (exchangeMessage(msg, chunk + 8, nullptr, nullptr) != 0) return -1;
+        offset += chunk;
+    }
+    if (length != aligned) {
+        u8 msg[12] = {0};
+        __le32 *hdr = (__le32 *)msg;
+        hdr[0] = cpu_to_le32(14);
+        hdr[1] = cpu_to_le32(4);
+        memcpy(msg + 8, bytes + aligned, length - aligned);
+        if (exchangeMessage(msg, sizeof(msg), nullptr, nullptr) != 0) return -1;
+    }
+    __le32 flush[2] = { cpu_to_le32(13), 0 };
+    return exchangeMessage(flush, sizeof(flush), nullptr, nullptr);
+}
+
+int QCABMI::execute(u32 address, u32 param, u32 *result)
 {
     struct {
         __le32 cmd;
@@ -122,7 +169,13 @@ int QCABMI::execute(u32 address, u32 param)
     req.addr = cpu_to_le32(address);
     req.param = cpu_to_le32(param);
 
-    return exchangeMessage(&req, sizeof(req), nullptr, nullptr);
+    if (!result) return exchangeMessage(&req, sizeof(req), nullptr, nullptr);
+    __le32 response = 0;
+    u32 responseLen = sizeof(response);
+    if (exchangeMessage(&req, sizeof(req), &response, &responseLen) != 0 || responseLen != sizeof(response))
+        return -1;
+    *result = le32_to_cpu(response);
+    return 0;
 }
 
 int QCABMI::setAppStart(u32 address)

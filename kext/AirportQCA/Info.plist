@@ -32,6 +32,8 @@
 			<string>airport</string>
 			<key>IOPCIPrimaryMatch</key>
 			<string>0x0042168c</string>
+			<key>IOPCIMatch</key>
+			<string>0x0042168c</string>
 			<key>IOPCITunnelCompatible</key>
 			<true/>
 			<key>IOProbeScore</key>

@@ -57,22 +57,18 @@
 /* Copy Engine Register Offsets within CE Window */
 #define CE_SRC_RING_BASE_ADDR_OFFSET        0x00000000
 #define CE_SRC_RING_SZ_OFFSET               0x00000004
-#define CE_SRC_RING_DMAX_OFFSET             0x00000008
-#define CE_SRC_WATERMARK_OFFSET             0x0000000C
-#define CE_SRC_WR_INDEX_OFFSET              0x00000010
-#define CE_SRC_RD_INDEX_OFFSET              0x00000014
-
-#define CE_DST_RING_BASE_ADDR_OFFSET        0x00000018
-#define CE_DST_RING_SZ_OFFSET               0x0000001C
-#define CE_DST_RING_DMAX_OFFSET             0x00000020
-#define CE_DST_WATERMARK_OFFSET             0x00000024
-#define CE_DST_WR_INDEX_OFFSET              0x00000028
-#define CE_DST_RD_INDEX_OFFSET              0x0000002C
-
-#define CE_CTRL1_OFFSET                     0x00000030
+#define CE_DST_RING_BASE_ADDR_OFFSET        0x00000008
+#define CE_DST_RING_SZ_OFFSET               0x0000000C
+#define CE_CTRL1_OFFSET                     0x00000010
+#define CE_CMD_OFFSET                       0x00000018
+#define CE_HOST_IE_OFFSET                   0x0000002C
+#define CE_MISC_IE_OFFSET                   0x00000034
+#define CE_SRC_WR_INDEX_OFFSET              0x0000003C
+#define CE_DST_WR_INDEX_OFFSET              0x00000040
+#define CE_SRC_RD_INDEX_OFFSET              0x00000044
+#define CE_DST_RD_INDEX_OFFSET              0x00000048
 #define CE_CTRL1_DMAX_MASK                  0x0000FFFF
-#define CE_CTRL1_COMPL_INTR_EN              0x00010000
-#define CE_CTRL1_WATERMARK_INTR_EN          0x00020000
-#define CE_CTRL1_ERR_INTR_EN                0x00040000
+#define CE_CTRL1_SRC_RING_ENABLE            0x00010000
+#define CE_CTRL1_DST_RING_ENABLE            0x00020000
 
 #endif /* _QCA_REGS_H_ */

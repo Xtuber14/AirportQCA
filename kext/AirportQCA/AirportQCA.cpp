@@ -4,13 +4,23 @@
 //
 
 #include "AirportQCA.hpp"
+#include <IOKit/network/IOOutputQueue.h>
 #include "AirportQCAInterface.hpp"
+#include "AirportQCAEthernetInterface.hpp"
 #include "hw/QCAPCIDevice.hpp"
 
 #define super IO80211Controller
 OSDefineMetaClassAndStructors(AirportQCA, IO80211Controller)
 
 #define kWatchDogPeriodMs 1000
+
+static IOReturn qcaPrepareBSDInterface(OSObject *owner, void *arg0, void *, void *, void *)
+{
+    AirportQCA *driver = OSDynamicCast(AirportQCA, owner);
+    return driver && driver->getSkywalkInterface()
+        ? driver->getSkywalkInterface()->prepareBSDInterface((ifnet_t)arg0, 0)
+        : kIOReturnNotReady;
+}
 
 bool AirportQCA::init(OSDictionary *properties)
 {
@@ -20,6 +30,7 @@ bool AirportQCA::init(OSDictionary *properties)
 
     fPciNub = nullptr;
     fNetIf = nullptr;
+    fBSDInterface = nullptr;
     fWorkLoop = nullptr;
     fCommandGate = nullptr;
     fInterruptSource = nullptr;
@@ -97,7 +108,7 @@ bool AirportQCA::start(IOService *provider)
 
     fPciNub = OSDynamicCast(IOPCIDevice, provider);
     if (!fPciNub) {
-        super::stop(provider);
+        stop(provider);
         return false;
     }
 
@@ -108,14 +119,14 @@ bool AirportQCA::start(IOService *provider)
 
     if (!createWorkLoop()) {
         qca_err("Failed to create workloop");
-        super::stop(provider);
+        stop(provider);
         return false;
     }
 
     fCommandGate = IOCommandGate::commandGate(this);
     if (!fCommandGate) {
         qca_err("Failed to create command gate");
-        super::stop(provider);
+        stop(provider);
         return false;
     }
     fWorkLoop->addEventSource(fCommandGate);
@@ -125,7 +136,7 @@ bool AirportQCA::start(IOService *provider)
         !setCurrentMedium(primaryMedium) ||
         !setSelectedMedium(primaryMedium)) {
         qca_err("Failed to setup network mediums");
-        super::stop(provider);
+        stop(provider);
         return false;
     }
 
@@ -134,18 +145,57 @@ bool AirportQCA::start(IOService *provider)
     if (!hal || !hal->init(fPciNub, this)) {
         qca_err("Failed to initialize QCAPCIDevice HAL");
         if (hal) delete hal;
-        super::stop(provider);
+        stop(provider);
         return false;
     }
     fHalDevice = hal;
 
-    /* Retrieve hardware MAC address */
-    hal->getMacAddress(fMacAddress.bytes);
+    /* Keep the valid fallback until the HAL can read a provisioned address. */
+    uint8_t hardwareAddress[sizeof(fMacAddress.bytes)] = {};
+    hal->getMacAddress(hardwareAddress);
+    uint8_t macBits = 0;
+    for (unsigned i = 0; i < sizeof(hardwareAddress); ++i) macBits |= hardwareAddress[i];
+    if (macBits && !(hardwareAddress[0] & 1))
+        memcpy(fMacAddress.bytes, hardwareAddress, sizeof(hardwareAddress));
 
-    /* Attach network interface */
-    if (!attachInterface((IONetworkInterface **)&fNetIf, true)) {
-        qca_err("Failed to attach IO80211Interface");
-        super::stop(provider);
+    /* Register the Tahoe Skywalk protocol and its BSD-facing Ethernet interface. */
+    fNetIf = new AirportQCAInterface;
+    if (!fNetIf || !fNetIf->init()) {
+        qca_err("Failed to initialize Tahoe infrastructure interface");
+        OSSafeReleaseNULL(fNetIf);
+        stop(provider);
+        return false;
+    }
+    fNetIf->setDriver(this);
+    fNetIf->setInterfaceRole(1);
+    fNetIf->setInterfaceId(1);
+    if (!fNetIf->attach(this) || !attachInterface(fNetIf, this) ||
+        !IONetworkController::attachInterface((IONetworkInterface **)&fBSDInterface, false)) {
+        qca_err("Failed to attach Tahoe Skywalk/BSD interfaces");
+        stop(provider);
+        return false;
+    }
+    IOSkywalkEthernetInterface::RegistrationInfo registrationInfo = {};
+    if (!fNetIf->initRegistrationInfo(&registrationInfo, 1, sizeof(registrationInfo))) {
+        qca_err("Failed to initialize Tahoe Skywalk registration info");
+        stop(provider);
+        return false;
+    }
+    fNetIf->mExpansionData->fRegistrationInfo =
+        (IOSkywalkNetworkInterface::RegistrationInfo *)IOMalloc(sizeof(IOSkywalkNetworkInterface::RegistrationInfo));
+    fNetIf->mExpansionData2->fRegistrationInfo =
+        (IOSkywalkEthernetInterface::RegistrationInfo *)IOMalloc(sizeof(IOSkywalkEthernetInterface::RegistrationInfo));
+    if (!fNetIf->mExpansionData->fRegistrationInfo || !fNetIf->mExpansionData2->fRegistrationInfo) {
+        qca_err("Failed to allocate Tahoe Skywalk registration info");
+        stop(provider);
+        return false;
+    }
+    memcpy(fNetIf->mExpansionData->fRegistrationInfo, &registrationInfo, sizeof(registrationInfo));
+    memcpy(fNetIf->mExpansionData2->fRegistrationInfo, &registrationInfo, sizeof(registrationInfo));
+    fNetIf->deferBSDAttach(true);
+    if (!fNetIf->start(this)) {
+        qca_err("Failed to start Tahoe Skywalk interface");
+        stop(provider);
         return false;
     }
 
@@ -164,7 +214,7 @@ bool AirportQCA::start(IOService *provider)
 
     setLinkStatus(kIONetworkLinkValid);
     registerService();
-    fNetIf->registerService();
+    if (fBSDInterface) fBSDInterface->registerService();
 
     qca_info("AirportQCA started successfully with native AirPort interface");
     return true;
@@ -192,7 +242,21 @@ void AirportQCA::stop(IOService *provider)
         fInterruptSource = nullptr;
     }
 
+    if (fBSDInterface) {
+        IONetworkController::detachInterface(fBSDInterface, true);
+        fBSDInterface->release();
+        fBSDInterface = nullptr;
+    }
     if (fNetIf) {
+        fNetIf->stop(this);
+        if (fNetIf->mExpansionData && fNetIf->mExpansionData->fRegistrationInfo) {
+            IOFree(fNetIf->mExpansionData->fRegistrationInfo, sizeof(IOSkywalkNetworkInterface::RegistrationInfo));
+            fNetIf->mExpansionData->fRegistrationInfo = nullptr;
+        }
+        if (fNetIf->mExpansionData2 && fNetIf->mExpansionData2->fRegistrationInfo) {
+            IOFree(fNetIf->mExpansionData2->fRegistrationInfo, sizeof(IOSkywalkEthernetInterface::RegistrationInfo));
+            fNetIf->mExpansionData2->fRegistrationInfo = nullptr;
+        }
         detachInterface(fNetIf, true);
         fNetIf->release();
         fNetIf = nullptr;
@@ -215,14 +279,12 @@ void AirportQCA::stop(IOService *provider)
 
 IONetworkInterface* AirportQCA::createInterface()
 {
-    AirportQCAInterface *netif = new AirportQCAInterface;
-    if (!netif) {
+    AirportQCAEthernetInterface *netif = new AirportQCAEthernetInterface;
+    if (!netif || !netif->initWithSkywalkInterface(this, fNetIf)) {
+        OSSafeReleaseNULL(netif);
         return nullptr;
     }
-    if (!netif->init(this, this)) {
-        netif->release();
-        return nullptr;
-    }
+    fBSDInterface = netif;
     return netif;
 }
 
@@ -263,6 +325,20 @@ IOReturn AirportQCA::getHardwareAddress(IOEthernetAddress *addrP)
     return kIOReturnSuccess;
 }
 
+#ifdef IO80211FAMILY_V2
+IOReturn AirportQCA::setHardwareAddress(const void *addr, UInt32 addrBytes)
+{
+    if (!addr || addrBytes != sizeof(fMacAddress.bytes)) return kIOReturnBadArgument;
+    const uint8_t *bytes = static_cast<const uint8_t *>(addr);
+    uint8_t bits = 0;
+    for (unsigned i = 0; i < addrBytes; ++i) bits |= bytes[i];
+    if (!bits || (bytes[0] & 1)) return kIOReturnBadArgument;
+    memcpy(fMacAddress.bytes, bytes, sizeof(fMacAddress.bytes));
+    return kIOReturnSuccess;
+}
+#endif
+
+#ifndef IO80211FAMILY_V2
 IOReturn AirportQCA::setHardwareAddress(const IOEthernetAddress *addrP)
 {
     if (!addrP) return kIOReturnBadArgument;
@@ -270,16 +346,22 @@ IOReturn AirportQCA::setHardwareAddress(const IOEthernetAddress *addrP)
     return kIOReturnSuccess;
 }
 
+#endif
+
 UInt32 AirportQCA::outputPacket(mbuf_t m, void *param)
 {
     if (!m) return 0;
     if (fHalDevice && fLinkActive) {
-        return static_cast<QCAPCIDevice*>(fHalDevice)->transmitPacket(m);
+        UInt32 result = static_cast<QCAPCIDevice*>(fHalDevice)->transmitPacket(m);
+        if (result == kIOReturnOutputSuccess) return result;
+        freePacket(m);
+        return kIOReturnOutputDropped;
     }
     freePacket(m);
     return 0;
 }
 
+#ifndef IO80211FAMILY_V2
 int AirportQCA::outputRaw80211Packet(IO80211Interface *interface, mbuf_t m)
 {
     if (!m) return 0;
@@ -296,11 +378,8 @@ bool AirportQCA::useAppleRSNSupplicant(IO80211Interface *interface)
     return true;
 }
 
-SInt32 AirportQCA::apple80211Request(
-    unsigned int request_type,
-    int request_number,
-    IO80211Interface *interface,
-    void *data)
+
+SInt32 AirportQCA::dispatchApple80211Request(unsigned int request_type, int request_number, void *data)
 {
     if (request_type != SIOCGA80211 && request_type != SIOCSA80211) {
         return kIOReturnError;
@@ -567,7 +646,7 @@ SInt32 AirportQCA::apple80211Request(
                 static_cast<QCAPCIDevice*>(fHalDevice)->startScan();
             }
             if (fNetIf) {
-                fNetIf->postMessage(APPLE80211_M_SCAN_DONE);
+                fNetIf->postMessage(APPLE80211_M_SCAN_DONE, nullptr, 0, false);
             }
             return kIOReturnSuccess;
         }
@@ -615,6 +694,17 @@ SInt32 AirportQCA::apple80211Request(
     return kIOReturnSuccess;
 }
 
+#endif
+
+
+#ifndef IO80211FAMILY_V2
+SInt32 AirportQCA::apple80211Request(unsigned int type, int number, IO80211Interface *, void *data)
+{
+    return dispatchApple80211Request(type, number, data);
+}
+#endif
+
+
 const OSString* AirportQCA::newVendorString() const
 {
     return OSString::withCString("Qualcomm Atheros");
@@ -642,7 +732,13 @@ bool AirportQCA::createMediumTables(const IONetworkMedium **primary)
 
 bool AirportQCA::setLinkStatus(UInt32 status, const IONetworkMedium *activeMedium, UInt64 speed, OSData *data)
 {
-    return super::setLinkStatus(status, activeMedium, speed, data);
+    bool result = super::setLinkStatus(status, activeMedium, speed, data);
+    if (fNetIf) {
+        bool active = (status & kIONetworkLinkActive) != 0;
+        fNetIf->setLinkState(active ? kIO80211NetworkLinkUp : kIO80211NetworkLinkDown, 0, false, 30, 0);
+        if (fBSDInterface) fBSDInterface->setLinkState(active ? kIO80211NetworkLinkUp : kIO80211NetworkLinkDown);
+    }
+    return result;
 }
 
 void AirportQCA::watchdogAction(IOTimerEventSource *timer)
@@ -670,6 +766,61 @@ IOReturn AirportQCA::setPowerState(unsigned long powerStateOrdinal, IOService *w
     return IOPMAckImplied;
 }
 
+void AirportQCA::interfaceSetChannel(UInt32 channel)
+{
+    if (channel == 0 || channel > 196) return;
+    fChannel = channel;
+    if (fHalDevice) static_cast<QCAPCIDevice *>(fHalDevice)->setChannel(channel);
+}
+
+void AirportQCA::interfaceSetPower(bool enabled)
+{
+    if (fBSDInterface) {
+        if (enabled) enable(fBSDInterface);
+        else disable(fBSDInterface);
+    }
+}
+
+IOReturn AirportQCA::prepareSkywalkBSDInterface(ifnet_t interface)
+{
+    return fCommandGate && interface
+        ? fCommandGate->runAction(qcaPrepareBSDInterface, interface)
+        : kIOReturnNotReady;
+}
+
+#ifdef IO80211FAMILY_V2
+bool AirportQCA::isCommandProhibited(int) { return false; }
+SInt32 AirportQCA::handleCardSpecific(IO80211SkywalkInterface *, unsigned long, void *, bool) { return kIOReturnUnsupported; }
+IOReturn AirportQCA::getDRIVER_VERSION(IO80211SkywalkInterface *, apple80211_version_data *d) { if (!d) return kIOReturnBadArgument; memset(d, 0, sizeof(*d)); d->version = APPLE80211_VERSION; d->string_len = (u_int16_t)snprintf(d->string, sizeof(d->string), "AirportQCA Tahoe"); return kIOReturnSuccess; }
+IOReturn AirportQCA::getHARDWARE_VERSION(IO80211SkywalkInterface *, apple80211_version_data *d) { if (!d) return kIOReturnBadArgument; memset(d, 0, sizeof(*d)); d->version = APPLE80211_VERSION; d->string_len = (u_int16_t)snprintf(d->string, sizeof(d->string), "Qualcomm Atheros QCA9377"); return kIOReturnSuccess; }
+IOReturn AirportQCA::getCARD_CAPABILITIES(IO80211SkywalkInterface *, apple80211_capability_data *d)
+{
+    if (!d) return kIOReturnBadArgument;
+    memset(d, 0, sizeof(*d));
+    d->version = APPLE80211_VERSION;
+    d->capabilities[0] = (1 << APPLE80211_CAP_WEP) | (1 << APPLE80211_CAP_TKIP) |
+        (1 << APPLE80211_CAP_AES_CCM) | (1 << APPLE80211_CAP_IBSS) | (1 << APPLE80211_CAP_PMGT);
+    d->capabilities[1] = (1 << (APPLE80211_CAP_TXPMGT - 8)) |
+        (1 << (APPLE80211_CAP_SHSLOT - 8)) | (1 << (APPLE80211_CAP_SHPREAMBLE - 8)) |
+        (1 << (APPLE80211_CAP_MONITOR - 8)) | (1 << (APPLE80211_CAP_TKIPMIC - 8)) |
+        (1 << (APPLE80211_CAP_WPA1 - 8)) | (1 << (APPLE80211_CAP_WPA2 - 8)) |
+        (1 << (APPLE80211_CAP_WPA - 8));
+    d->capabilities[2] = (1 << (APPLE80211_CAP_BURST - 16)) |
+        (1 << (APPLE80211_CAP_WME - 16)) | (1 << (APPLE80211_CAP_SHORT_GI_40MHZ - 16)) |
+        (1 << (APPLE80211_CAP_SHORT_GI_20MHZ - 16));
+    return kIOReturnSuccess;
+}
+IOReturn AirportQCA::getPOWER(IO80211SkywalkInterface *, apple80211_power_data *d) { if (!d) return kIOReturnBadArgument; memset(d, 0, sizeof(*d)); d->version = APPLE80211_VERSION; d->num_radios = 1; d->power_state[0] = fPowerState == kQCAPowerStateOn ? APPLE80211_POWER_ON : APPLE80211_POWER_OFF; return kIOReturnSuccess; }
+IOReturn AirportQCA::setPOWER(IO80211SkywalkInterface *, apple80211_power_data *d) { if (!d) return kIOReturnBadArgument; interfaceSetPower(d->power_state[0] != APPLE80211_POWER_OFF); return kIOReturnSuccess; }
+IOReturn AirportQCA::getCOUNTRY_CODE(IO80211SkywalkInterface *, apple80211_country_code_data *d) { if (!d) return kIOReturnBadArgument; memset(d, 0, sizeof(*d)); d->version = APPLE80211_VERSION; return kIOReturnSuccess; }
+IOReturn AirportQCA::setCOUNTRY_CODE(IO80211SkywalkInterface *, apple80211_country_code_data *) { return kIOReturnSuccess; }
+IOReturn AirportQCA::setGET_DEBUG_INFO(IO80211SkywalkInterface *, apple80211_debug_command *) { return kIOReturnUnsupported; }
+CCLogStream *AirportQCA::getLogger() const { return nullptr; }
+CommonFaultReporter *AirportQCA::getFaultReporterFromDriver() { return nullptr; }
+UInt32 AirportQCA::hardwareOutputQueueDepth() { return 64; }
+SInt32 AirportQCA::performCountryCodeOperation(IO80211CountryCodeOp) { return kIOReturnSuccess; }
+SInt32 AirportQCA::monitorModeSetEnabled(bool, unsigned int) { return kIOReturnUnsupported; }
+#else
 // -------------------------------------------------------
 // IO80211Controller pure virtual overrides
 // -------------------------------------------------------
@@ -745,3 +896,5 @@ SInt32 AirportQCA::apple80211VirtualRequest(UInt request_type, int request_numbe
 {
     return kIOReturnUnsupported;
 }
+
+#endif

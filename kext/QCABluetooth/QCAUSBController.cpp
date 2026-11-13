@@ -20,7 +20,47 @@ bool QCAUSBController::initWithDevice(IOService *client, IOUSBHostDevice *dev)
     fBulkOutPipe = nullptr;
 
     fDevice->retain();
-    return true;
+    return openBulkOutInterface();
+}
+
+bool QCAUSBController::openBulkOutInterface()
+{
+    if (!fDevice->getConfigurationDescriptor()) {
+        const StandardUSB::ConfigurationDescriptor *configuration = fDevice->getConfigurationDescriptor(0);
+        if (!configuration || fDevice->setConfiguration(configuration->bConfigurationValue) != kIOReturnSuccess) {
+            return false;
+        }
+    }
+
+    OSIterator *iterator = fDevice->getChildIterator(gIOServicePlane);
+    if (!iterator) return false;
+
+    OSObject *candidate = nullptr;
+    while ((candidate = iterator->getNextObject()) != nullptr) {
+        IOUSBHostInterface *interface = OSDynamicCast(IOUSBHostInterface, candidate);
+        if (!interface) continue;
+
+        const StandardUSB::ConfigurationDescriptor *configuration = interface->getConfigurationDescriptor();
+        const StandardUSB::InterfaceDescriptor *descriptor = interface->getInterfaceDescriptor();
+        if (!configuration || !descriptor) continue;
+
+        const StandardUSB::EndpointDescriptor *endpoint = nullptr;
+        while ((endpoint = StandardUSB::getNextEndpointDescriptor(configuration, descriptor, endpoint)) != nullptr) {
+            if (StandardUSB::getEndpointAddress(endpoint) == 0x02 &&
+                StandardUSB::getEndpointDirection(endpoint) == kEndpointDirectionOut &&
+                StandardUSB::getEndpointType(endpoint) == kEndpointTypeBulk) {
+                fInterface = interface;
+                fInterface->retain();
+                break;
+            }
+        }
+        if (fInterface) break;
+    }
+    iterator->release();
+
+    if (!fInterface || !fInterface->open(fClient)) return false;
+    fBulkOutPipe = fInterface->copyPipe(0x02);
+    return fBulkOutPipe != nullptr;
 }
 
 void QCAUSBController::free()
@@ -55,7 +95,9 @@ IOReturn QCAUSBController::sendVendorRequestIn(uint8_t request, void *data, uint
     req.wLength = size;
 
     uint32_t bytesTransferred = 0;
-    return fDevice->deviceRequest(fClient, req, data, bytesTransferred, 2000);
+    IOReturn result = fDevice->deviceRequest(fClient, req, data, bytesTransferred, 2000);
+    if (result == kIOReturnSuccess && bytesTransferred != size) return kIOReturnUnderrun;
+    return result;
 }
 
 IOReturn QCAUSBController::sendVendorRequestOut(uint8_t request, const void *data, uint16_t size)
@@ -70,7 +112,9 @@ IOReturn QCAUSBController::sendVendorRequestOut(uint8_t request, const void *dat
     req.wLength = size;
 
     uint32_t bytesTransferred = 0;
-    return fDevice->deviceRequest(fClient, req, const_cast<void*>(data), bytesTransferred, 2000);
+    IOReturn result = fDevice->deviceRequest(fClient, req, const_cast<void*>(data), bytesTransferred, 2000);
+    if (result == kIOReturnSuccess && bytesTransferred != size) return kIOReturnUnderrun;
+    return result;
 }
 
 IOReturn QCAUSBController::bulkWrite(const void *data, uint32_t length, uint32_t timeoutMs)
@@ -88,6 +132,7 @@ IOReturn QCAUSBController::bulkWrite(const void *data, uint32_t length, uint32_t
     uint32_t transferred = 0;
     IOReturn ret = fBulkOutPipe->io(desc, length, transferred, timeoutMs);
     desc->release();
+    if (ret == kIOReturnSuccess && transferred != length) return kIOReturnUnderrun;
     return ret;
 }
 

@@ -20,6 +20,7 @@ public:
 
     bool init();
     bool connectService(u8 epId, u16 serviceId);
+    bool start();
 
     int send(u8 epId, void *buf, u32 len);
     int recv(u8 epId, void *buf, u32 *len);
@@ -33,6 +34,12 @@ private:
     QCAPCIDevice *fPci;
     u32 fCredits[ATH10K_HTC_EP_COUNT];
     bool fConnected[ATH10K_HTC_EP_COUNT];
+    u16 fService[ATH10K_HTC_EP_COUNT];
+    u16 fMaxMessage[ATH10K_HTC_EP_COUNT];
+    u8 fPipeOut[ATH10K_HTC_EP_COUNT];
+    u8 fPipeIn[ATH10K_HTC_EP_COUNT];
+    u8 fSequence[ATH10K_HTC_EP_COUNT];
+    u16 fCreditSize;
 };
 
 #endif /* _QCA_HTC_HPP_ */

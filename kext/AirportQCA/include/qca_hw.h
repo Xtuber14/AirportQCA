@@ -65,6 +65,9 @@ struct ath10k_htc_hdr {
     u8 eid;          /* Endpoint ID */
     u8 flags;        /* Flags */
     __le16 len;      /* Payload length excluding header */
+    u8 control0;
+    u8 control1;
+    __le16 padLen;
 } __attribute__((packed));
 
 #define ATH10K_HTC_FLAG_NEED_CREDIT_UPDATE  0x01
@@ -81,8 +84,8 @@ enum ath10k_htc_ep_id {
 
 /* WMI Services */
 enum ath10k_service_id {
-    ATH10K_SERVICE_WMI_CONTROL = 1,
-    ATH10K_SERVICE_HTT_DATA    = 2,
+    ATH10K_SERVICE_WMI_CONTROL = 0x0100,
+    ATH10K_SERVICE_HTT_DATA    = 0x0300,
 };
 
 #endif /* _QCA_HW_H_ */

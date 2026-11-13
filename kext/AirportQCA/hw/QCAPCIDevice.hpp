@@ -60,9 +60,11 @@ public:
     UInt32 transmitPacket(mbuf_t m);
     int transmitRaw80211(mbuf_t m);
     void watchdogCheck();
+    void freePacket(mbuf_t packet);
 
     /* Subsystem access */
     QCACopyEngine* getCopyEngine() const { return fCopyEngine; }
+    QCAHTC*        getHTC() const         { return fHtc; }
     IOPCIDevice*   getPciNub() const     { return fPciNub; }
 
 private:

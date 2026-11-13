@@ -7,6 +7,7 @@
 #include "QCAUSBController.hpp"
 #include <IOKit/IORegistryEntry.h>
 #include <IOKit/IODeviceTreeSupport.h>
+#include <libkern/OSByteOrder.h>
 
 #define super IOService
 OSDefineMetaClassAndStructors(QCABluetoothFirmware, IOService)
@@ -75,13 +76,19 @@ bool QCABluetoothFirmware::start(IOService *provider)
 
     if (!fDevice->open(this)) {
         IOLog("QCABluetoothFirmware: failed to open USB device\n");
+        super::stop(provider);
         return false;
     }
 
     fUsbController = new QCAUSBController();
     if (!fUsbController || !fUsbController->initWithDevice(this, fDevice)) {
         IOLog("QCABluetoothFirmware: failed to init USB controller\n");
+        if (fUsbController) {
+            fUsbController->release();
+            fUsbController = nullptr;
+        }
         fDevice->close(this);
+        super::stop(provider);
         return false;
     }
 
@@ -94,9 +101,16 @@ bool QCABluetoothFirmware::start(IOService *provider)
         fUsbController = nullptr;
     }
 
-    /* Handoff: close device so Apple's native Bluetooth stack can claim it */
+    if (!success) {
+        fDevice->close(this);
+        super::stop(provider);
+        IOLog("QCABluetoothFirmware: firmware upload failed; refusing native Bluetooth handoff\n");
+        return false;
+    }
+
+    /* Handoff: close device so Apple's native Bluetooth stack can claim it. */
     fDevice->close(this);
-    IOLog("QCABluetoothFirmware: firmware injected; device handed off to native macOS Bluetooth\n");
+    IOLog("QCABluetoothFirmware: firmware upload reported complete; device handed off to native macOS Bluetooth\n");
     return true;
 }
 
@@ -116,12 +130,15 @@ bool QCABluetoothFirmware::uploadFirmware()
         return false;
     }
 
+    const uint32_t romVersion = OSSwapLittleToHostInt32(ver.rom_version);
     IOLog("QCABluetoothFirmware: detected ROM version 0x%08x, patch 0x%08x\n",
-          ver.rom_version, ver.patch_version);
+          romVersion, OSSwapLittleToHostInt32(ver.patch_version));
 
-    if (ver.rom_version == 0x00000302) {
-        IOLog("QCABluetoothFirmware: verified QCA Rome 3.2 / QCA9377 hardware\n");
+    if (romVersion != 0x00000302) {
+        IOLog("QCABluetoothFirmware: unsupported Rome ROM version 0x%08x\n", romVersion);
+        return false;
     }
+    IOLog("QCABluetoothFirmware: verified QCA Rome 3.2 / QCA9377 hardware\n");
 
     /* Query status to determine if patch is required */
     uint8_t status = 0;
@@ -131,28 +148,88 @@ bool QCABluetoothFirmware::uploadFirmware()
         return false;
     }
 
-    /* If both rampatch and syscfg are already updated, skip downloading */
-    if ((status & (QCA_PATCH_UPDATED | QCA_SYSCFG_UPDATED)) == (QCA_PATCH_UPDATED | QCA_SYSCFG_UPDATED)) {
-        IOLog("QCABluetoothFirmware: ROM already patched (status=0x%02x), skipping upload\n", status);
-        return true;
-    }
-
     if (!(status & QCA_PATCH_UPDATED)) {
-        IOLog("QCABluetoothFirmware: downloading rampatch_usb_00000302.bin\n");
-        /* In production, rampatch header and payload blocks are streamed */
+        const uint8_t *patch = qca_rampatch_usb_00000302_bin;
+        const uint32_t patchSize = qca_rampatch_usb_00000302_bin_len;
+        if (patchSize < QCA_DFU_HEADER_SIZE + 6 || patch[16] != 0x08 ||
+            patch[17] != 0x00 || patch[18] != 0x02 || patch[19] != 0x03) {
+            IOLog("QCABluetoothFirmware: bundled rampatch header/version is invalid\n");
+            return false;
+        }
+        const uint16_t patchVersion = static_cast<uint16_t>(
+            static_cast<uint16_t>(patch[20]) | (static_cast<uint16_t>(patch[21]) << 8));
+        const uint32_t currentPatch = OSSwapLittleToHostInt32(ver.patch_version);
+        if (patchVersion < currentPatch) {
+            IOLog("QCABluetoothFirmware: bundled rampatch 0x%04x is older than controller patch 0x%08x\n",
+                  patchVersion, currentPatch);
+            return false;
+        }
+
+        IOLog("QCABluetoothFirmware: uploading Rome 3.2 rampatch (%u bytes)\n", patchSize);
+        if (fUsbController->sendVendorRequestOut(QCA_DFU_DOWNLOAD, patch, QCA_DFU_HEADER_SIZE) != kIOReturnSuccess) {
+            IOLog("QCABluetoothFirmware: failed to send rampatch header\n");
+            return false;
+        }
+        IODelay(20000);
+        for (uint32_t offset = QCA_DFU_HEADER_SIZE; offset < patchSize;) {
+            const uint32_t chunk = (patchSize - offset > QCA_DFU_PACKET_SIZE)
+                ? QCA_DFU_PACKET_SIZE : patchSize - offset;
+            IOReturn result = fUsbController->bulkWrite(patch + offset, chunk, 3000);
+            if (result != kIOReturnSuccess) {
+                IOLog("QCABluetoothFirmware: rampatch transfer failed at %u/%u (0x%08x)\n",
+                      offset, patchSize, result);
+                return false;
+            }
+            offset += chunk;
+        }
+
+        /* ROM updates its patch version after accepting the bulk stream. */
+        IODelay(20000);
+        memset(&ver, 0, sizeof(ver));
+        if (fUsbController->sendVendorRequestIn(QCA_GET_TARGET_VERSION, &ver, sizeof(ver)) != kIOReturnSuccess ||
+            OSSwapLittleToHostInt32(ver.rom_version) != romVersion ||
+            OSSwapLittleToHostInt32(ver.patch_version) < patchVersion) {
+            IOLog("QCABluetoothFirmware: controller did not report the uploaded rampatch\n");
+            return false;
+        }
     }
 
     if (!(status & QCA_SYSCFG_UPDATED)) {
-        IOLog("QCABluetoothFirmware: downloading nvm_usb_00000302.bin\n");
-        /* In production, NVM table is streamed */
+        const uint8_t *nvm = qca_nvm_usb_00000302_bin;
+        const uint32_t nvmSize = qca_nvm_usb_00000302_bin_len;
+        if (nvmSize <= QCA_NVM_HEADER_SIZE) {
+            IOLog("QCABluetoothFirmware: bundled NVM image is invalid\n");
+            return false;
+        }
+        IOLog("QCABluetoothFirmware: uploading Rome 3.2 NVM (%u bytes)\n", nvmSize);
+        if (fUsbController->sendVendorRequestOut(QCA_DFU_DOWNLOAD, nvm, QCA_NVM_HEADER_SIZE) != kIOReturnSuccess) {
+            IOLog("QCABluetoothFirmware: failed to send NVM header\n");
+            return false;
+        }
+        IODelay(20000);
+        for (uint32_t offset = QCA_NVM_HEADER_SIZE; offset < nvmSize;) {
+            const uint32_t chunk = (nvmSize - offset > QCA_DFU_PACKET_SIZE)
+                ? QCA_DFU_PACKET_SIZE : nvmSize - offset;
+            IOReturn result = fUsbController->bulkWrite(nvm + offset, chunk, 3000);
+            if (result != kIOReturnSuccess) {
+                IOLog("QCABluetoothFirmware: NVM transfer failed at %u/%u (0x%08x)\n",
+                      offset, nvmSize, result);
+                return false;
+            }
+            offset += chunk;
+        }
     }
 
-    /*
-     * Note: Rome 3.2 (0x00000302) executes the rampatch directly in RAM without
-     * issuing an IOUSBHostDevice::reset(). Hardware USB bus resets trigger root hub
-     * disconnects and infinite boot loops.
-     */
-    IODelay(10000); /* 10 ms wait for firmware execution transition */
+    uint8_t finalStatus = 0;
+    IODelay(20000);
+    ret = fUsbController->sendVendorRequestIn(QCA_CHECK_STATUS, &finalStatus, sizeof(finalStatus));
+    if (ret != kIOReturnSuccess ||
+        (finalStatus & (QCA_PATCH_UPDATED | QCA_SYSCFG_UPDATED)) !=
+            (QCA_PATCH_UPDATED | QCA_SYSCFG_UPDATED)) {
+        IOLog("QCABluetoothFirmware: firmware status verification failed (status=0x%02x, result=0x%08x)\n",
+              finalStatus, ret);
+        return false;
+    }
 
     return true;
 }
@@ -218,6 +295,10 @@ void QCABluetoothFirmware::publishProperties(bool success)
          * bluetoothd can read a valid (14-byte) bluetoothInternalControllerInfo.
          */
         writeBluetoothNVRAM();
+    }
+
+    if (!success) {
+        return;
     }
 
     /*

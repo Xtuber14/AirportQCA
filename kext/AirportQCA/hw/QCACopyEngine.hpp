@@ -46,12 +46,15 @@ private:
 
         IOBufferMemoryDescriptor *srcRingMem;
         IOBufferMemoryDescriptor *dstRingMem;
+        IOBufferMemoryDescriptor *dstBufferMem;
 
         struct ce_desc *srcRing;
         struct ce_desc *dstRing;
+        UInt8 *dstBuffer;
 
         dma_addr_t srcRingPhys;
         dma_addr_t dstRingPhys;
+        dma_addr_t dstBufferPhys;
 
         u32 srcWrIdx;
         u32 srcRdIdx;
