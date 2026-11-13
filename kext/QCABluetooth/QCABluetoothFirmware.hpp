@@ -28,9 +28,12 @@ public:
 private:
     bool uploadFirmware();
     void publishProperties(bool success);
+    void writeBluetoothNVRAM();
 
     IOUSBHostDevice   *fDevice;
     QCAUSBController  *fUsbController;
+    uint16_t           fVendorID;
+    uint16_t           fProductID;
 };
 
 #endif /* _QCA_BLUETOOTH_FIRMWARE_HPP_ */

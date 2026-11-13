@@ -5,6 +5,8 @@
 
 #include "QCABluetoothFirmware.hpp"
 #include "QCAUSBController.hpp"
+#include <IOKit/IORegistryEntry.h>
+#include <IOKit/IODeviceTreeSupport.h>
 
 #define super IOService
 OSDefineMetaClassAndStructors(QCABluetoothFirmware, IOService)
@@ -16,6 +18,8 @@ bool QCABluetoothFirmware::init(OSDictionary *dictionary)
     }
     fDevice = nullptr;
     fUsbController = nullptr;
+    fVendorID = 0;
+    fProductID = 0;
     IOLog("QCABluetoothFirmware: driver init\n");
     return true;
 }
@@ -51,7 +55,10 @@ IOService* QCABluetoothFirmware::probe(IOService *provider, SInt32 *score)
     }
 
     *score += 5000;
-    IOLog("QCABluetoothFirmware: matched Qualcomm Rome Bluetooth USB device\n");
+    fVendorID  = USBToHost16(dev->getDeviceDescriptor()->idVendor);
+    fProductID = USBToHost16(dev->getDeviceDescriptor()->idProduct);
+    IOLog("QCABluetoothFirmware: matched Qualcomm Rome Bluetooth USB device (vid=0x%04x pid=0x%04x)\n",
+          fVendorID, fProductID);
     return this;
 }
 
@@ -150,12 +157,77 @@ bool QCABluetoothFirmware::uploadFirmware()
     return true;
 }
 
+void QCABluetoothFirmware::writeBluetoothNVRAM()
+{
+    /*
+     * Write bluetoothInternalControllerInfo to NVRAM.
+     *
+     * macOS Monterey+ (and BlueToolFixup with -btlfxnvramcheck) requires this key to
+     * be present under the Apple NVRAM GUID 7C436110-AB2A-4BBB-A880-FE41995C9F82.
+     * The key MUST be exactly 14 zero bytes — a different length (e.g. 32 bytes)
+     * causes BlueToolFixup and bluetoothd to reject the controller silently.
+     *
+     * We also set bluetoothExternalDongleFailed = 0x00 to signal the adapter
+     * is NOT a failed external dongle (native internal controller path).
+     *
+     * IORegistryEntry::fromPath("/options", gIODTPlane) accesses the NVRAM plane;
+     * the prefixed key name "GUID:key" is how IOPlatformExpertDevice stores NVRAM.
+     */
+    IORegistryEntry *nvram = IORegistryEntry::fromPath("/options", gIODTPlane);
+    if (!nvram) {
+        IOLog("QCABluetoothFirmware: could not access NVRAM /options node\n");
+        return;
+    }
+
+    /* 14 zero bytes — standard placeholder for non-Apple USB Bluetooth on macOS 12+ */
+    static const uint8_t kBtInfoValue[14] = { 0 };
+    OSData *btInfoData = OSData::withBytes(kBtInfoValue, sizeof(kBtInfoValue));
+    if (btInfoData) {
+        nvram->setProperty(
+            "7C436110-AB2A-4BBB-A880-FE41995C9F82:bluetoothInternalControllerInfo",
+            btInfoData);
+        btInfoData->release();
+        IOLog("QCABluetoothFirmware: wrote bluetoothInternalControllerInfo (14 bytes) to NVRAM\n");
+    }
+
+    /* Ensure dongle-failed flag is clear */
+    static const uint8_t kDongleFailed[1] = { 0 };
+    OSData *dongleData = OSData::withBytes(kDongleFailed, sizeof(kDongleFailed));
+    if (dongleData) {
+        nvram->setProperty(
+            "7C436110-AB2A-4BBB-A880-FE41995C9F82:bluetoothExternalDongleFailed",
+            dongleData);
+        dongleData->release();
+        IOLog("QCABluetoothFirmware: wrote bluetoothExternalDongleFailed=0x00 to NVRAM\n");
+    }
+
+    nvram->release();
+}
+
 void QCABluetoothFirmware::publishProperties(bool success)
 {
-    if (fDevice) {
-        fDevice->setProperty("FirmwareLoaded", success ? kOSBooleanTrue : kOSBooleanFalse);
-        if (version_major >= 21) { /* Monterey (Darwin 21) and newer */
-            fDevice->setName("Bluetooth USB Host Controller");
-        }
+    if (!fDevice) return;
+
+    fDevice->setProperty("FirmwareLoaded", success ? kOSBooleanTrue : kOSBooleanFalse);
+
+    if (success) {
+        /*
+         * Write correct NVRAM Bluetooth controller info.
+         * This is required BEFORE renaming the device so that when macOS's
+         * IOBluetoothHostControllerUSBTransport attaches after the rename,
+         * bluetoothd can read a valid (14-byte) bluetoothInternalControllerInfo.
+         */
+        writeBluetoothNVRAM();
+    }
+
+    /*
+     * Rename the device so macOS's native IOBluetoothHostControllerUSBTransport
+     * can re-match it. This is the signal to IOKit that firmware is loaded and
+     * the native BT stack should claim the device.
+     * Required for macOS Monterey (Darwin 21) through Tahoe (Darwin 26+).
+     */
+    if (version_major >= 21) {
+        fDevice->setName("Bluetooth USB Host Controller");
+        IOLog("QCABluetoothFirmware: device renamed to 'Bluetooth USB Host Controller'\n");
     }
 }
