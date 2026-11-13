@@ -207,7 +207,7 @@ By structuring development into **8 distinct milestones**, each phase can be ind
 ### Issue 1: Target Firmware Crash (`FW_IND_EVENT_PENDING`)
 - **Symptom**: `FW_INDICATOR_ADDRESS` has bit 1 set; CE7 generates continuous interrupts.
 - **Root Cause**: BDF mismatch or corrupted firmware image.
-- **Remedy**: Verify BDF length is exactly 8,124 bytes. Ensure `board-2.bin` matches the exact subsystem PCI ID of the card. Use `firmware-6.bin` from `source/linux-firmware`.
+- **Remedy**: Verify BDF length is exactly 8,124 bytes. Ensure `board-2.bin` matches the exact subsystem PCI ID of the card. Use `firmware-6.bin` and `board.bin` from `firmware/ath10k/QCA9377/hw1.0/`.
 
 ### Issue 2: Immediate Kernel Panic on Packet Reception (AppleVTD Fault)
 - **Symptom**: System crashes with `AppleVTD::PageFault` pointing to a host DMA address.

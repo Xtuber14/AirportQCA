@@ -74,7 +74,7 @@ AIRPORT_SRCS := \
 AIRPORT_OBJS := $(patsubst %.cpp, $(BUILD_DIR)/%.o, $(patsubst %.c, $(BUILD_DIR)/%.o, $(AIRPORT_SRCS)))
 AIRPORT_FIRMWARE_C := $(BUILD_DIR)/$(AIRPORT_DIR)/QCAFirmwareData.c
 AIRPORT_OBJS += $(BUILD_DIR)/$(AIRPORT_DIR)/QCAFirmwareData.o
-AIRPORT_FW_DIR := ../source/linux-firmware/ath10k/QCA9377/hw1.0
+AIRPORT_FW_DIR := ../firmware/ath10k/QCA9377/hw1.0
 AIRPORT_FW_IMAGE := $(AIRPORT_FW_DIR)/firmware-6.bin
 AIRPORT_BOARD_DATA := $(AIRPORT_FW_DIR)/board.bin
 
@@ -87,7 +87,7 @@ BT_FIRMWARE_C := $(BUILD_DIR)/$(BT_DIR)/QCAFirmwareData.c
 BT_OBJS := $(patsubst %.cpp, $(BUILD_DIR)/%.o, $(patsubst %.c, $(BUILD_DIR)/%.o, $(BT_SRCS)))
 BT_OBJS += $(BUILD_DIR)/$(BT_DIR)/QCAFirmwareData.o
 
-BT_FW_SOURCE_DIR := ../source/linux-firmware/qca
+BT_FW_SOURCE_DIR := ../firmware/qca
 BT_RAMPATCH := $(BT_FW_SOURCE_DIR)/rampatch_usb_00000302.bin
 BT_NVM := $(BT_FW_SOURCE_DIR)/nvm_usb_00000302.bin
 
@@ -168,7 +168,7 @@ $(BUILD_DIR)/$(BT_DIR)/QCAFirmwareData.o: $(BT_FIRMWARE_C)
 # -------------------------------------------------------------
 # Verification against OpenCore requirements
 # -------------------------------------------------------------
-verify:
+verify: $(AIRPORT_KEXT) $(BT_KEXT)
 	@echo "=========================================================="
 	@echo "Verifying Kext Bundles for OpenCore Compatibility"
 	@echo "=========================================================="

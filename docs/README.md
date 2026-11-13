@@ -9,7 +9,7 @@ The analysis is directly synthesized from the reference codebases provided in `s
 - **`source/ath/drivers/bluetooth`**: Linux Bluetooth subsystem (`btusb_main.c`, `btusb_qcom.c`, `btqca.c`) implementing Qualcomm Rome firmware upload.
 - **`source/itlwm`**: OpenIntelWireless native macOS Wi-Fi driver (`AirportItlwm`, `AirportItlwmV2`, `AirportItlwmSkywalkInterface`), establishing the standard for native Apple AirPort emulation on third-party silicon.
 - **`source/IntelBluetoothFirmware`**: OpenIntelWireless macOS USB firmware injector for third-party Bluetooth controllers.
-- **`source/linux-firmware`**: Upstream binary firmware images (`ath10k/QCA9377/hw1.0/` and `qca/`).
+- **`firmware/`**: Firmware binaries used by the build, organized by chipset/vendor (e.g. `ath10k/QCA9377/hw1.0/`, `qca/`), sourced from upstream `linux-firmware`.
 - **`source/xnu`**: Apple Darwin XNU kernel and IOKit framework (`IOPCIDevice`, `IOWorkLoop`, `IOCommandGate`, `IOBufferMemoryDescriptor`, `IOMapper`).
 
 ---
