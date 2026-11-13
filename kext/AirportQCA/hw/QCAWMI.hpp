@@ -49,6 +49,7 @@ public:
     int sendInitCmd();
     int waitServiceReady();
     int waitReady(u8 mac[6]);
+    void pollEvents();
     int createVdev(u32 vdevId, const u8 *mac);
     int startVdev(u32 vdevId, u32 channel, u32 chWidth);
     int stopVdev(u32 vdevId);

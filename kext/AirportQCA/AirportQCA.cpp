@@ -642,13 +642,9 @@ SInt32 AirportQCA::dispatchApple80211Request(unsigned int request_type, int requ
 
         case APPLE80211_IOC_SCAN_REQ: {
             qca_info("apple80211Request: SCAN_REQ");
-            if (fHalDevice) {
-                static_cast<QCAPCIDevice*>(fHalDevice)->startScan();
-            }
-            if (fNetIf) {
-                fNetIf->postMessage(APPLE80211_M_SCAN_DONE, nullptr, 0, false);
-            }
-            return kIOReturnSuccess;
+            if (!fHalDevice) return kIOReturnNotReady;
+            return static_cast<QCAPCIDevice*>(fHalDevice)->startScan() == 0
+                ? kIOReturnSuccess : kIOReturnIOError;
         }
 
         case APPLE80211_IOC_ASSOCIATE: {
@@ -743,12 +739,17 @@ bool AirportQCA::setLinkStatus(UInt32 status, const IONetworkMedium *activeMediu
 
 void AirportQCA::watchdogAction(IOTimerEventSource *timer)
 {
-    if (fHalDevice && fLinkActive) {
+    if (fHalDevice) {
         static_cast<QCAPCIDevice*>(fHalDevice)->watchdogCheck();
     }
     if (fWatchdogTimer) {
         fWatchdogTimer->setTimeoutMS(kWatchDogPeriodMs);
     }
+}
+
+void AirportQCA::notifyScanComplete()
+{
+    if (fNetIf) fNetIf->postMessage(APPLE80211_M_SCAN_DONE, nullptr, 0, false);
 }
 
 bool AirportQCA::initPCIPowerManagement(IOPCIDevice *pci)

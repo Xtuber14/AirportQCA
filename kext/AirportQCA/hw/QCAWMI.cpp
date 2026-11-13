@@ -14,6 +14,7 @@ static const u16 TAG_ARRAY_BYTE = 17;
 static const u16 TAG_ARRAY_FIXED_STRUCT = 19;
 static const u16 TAG_STRUCT_SERVICE_READY = 32;
 static const u16 TAG_STRUCT_READY = 35;
+static const u16 TAG_STRUCT_SCAN_EVENT = 36;
 static const u16 TAG_STRUCT_INIT = 74;
 static const u16 TAG_STRUCT_RESOURCE_CONFIG = 75;
 static const u16 TAG_STRUCT_HOST_MEM_REQ = 34;
@@ -32,6 +33,9 @@ static const u16 TAG_STRUCT_INSTALL_KEY = 96;
 static const u32 WMI_RX_DECAP_NATIVE_WIFI = 1;
 static const u16 WMI_EVENT_SERVICE_READY = 1;
 static const u16 WMI_EVENT_READY = 2;
+static const u32 WMI_EVENT_SCAN = 0x3001;
+static const u32 WMI_SCAN_EVENT_COMPLETED = 1U << 1;
+static const u32 WMI_SCAN_EVENT_START_FAILED = 1U << 6;
 static const u32 WMI_TLV_ABI_VER0 = 0x01000000;
 static const u32 WMI_TLV_ABI_VER1 = 53;
 static const u32 WMI_TLV_ABI_NS0 = 0x5F414351;
@@ -192,6 +196,44 @@ int QCAWMI::receiveEvent(u32 expectedEvent, void *payload, u32 *length)
         }
     }
     return -1;
+}
+
+void QCAWMI::pollEvents()
+{
+    QCAHTC *htc = fPci->getHTC();
+    if (!htc) return;
+
+    for (u32 count = 0; count < 16; ++count) {
+        u8 event[2048];
+        u32 eventLength = sizeof(event);
+        if (htc->recv(ATH10K_HTC_EP_1, event, &eventLength) != 0) break;
+        if (eventLength < sizeof(__le32)) continue;
+
+        const u32 eventId = readLE32(event) & 0x00ffffff;
+        if (eventId != WMI_EVENT_SCAN) {
+            continue;
+        }
+
+        u32 offset = sizeof(__le32);
+        bool scanFinished = false;
+        while (offset + sizeof(WmiTlvHeader) <= eventLength) {
+            WmiTlvHeader header;
+            memcpy(&header, event + offset, sizeof(header));
+            offset += sizeof(header);
+            const u16 tag = le16_to_cpu(header.tag);
+            const u16 length = le16_to_cpu(header.len);
+            if (length > eventLength - offset) break;
+            if (tag == TAG_STRUCT_SCAN_EVENT && length >= 24) {
+                const u32 eventType = readLE32(event + offset);
+                if (eventType & (WMI_SCAN_EVENT_COMPLETED | WMI_SCAN_EVENT_START_FAILED)) {
+                    qca_info("Firmware scan finished (event=0x%x)", eventType);
+                    scanFinished = true;
+                }
+            }
+            offset += length;
+        }
+        if (scanFinished) fPci->notifyScanComplete();
+    }
 }
 
 int QCAWMI::waitServiceReady()

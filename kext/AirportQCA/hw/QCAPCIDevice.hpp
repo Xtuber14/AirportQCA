@@ -53,7 +53,7 @@ public:
 
     /* Wi-Fi Control & Data Operations */
     void setChannel(uint32_t channel);
-    void startScan();
+    int startScan();
     void associate(apple80211_assoc_data *assoc);
     void disassociate();
     void installKey(apple80211_key *key);
@@ -61,6 +61,7 @@ public:
     int transmitRaw80211(mbuf_t m);
     void watchdogCheck();
     void freePacket(mbuf_t packet);
+    void notifyScanComplete();
 
     /* Subsystem access */
     QCACopyEngine* getCopyEngine() const { return fCopyEngine; }

@@ -128,6 +128,7 @@ public:
 
     /* Watchdog & Periodic Timers */
     void watchdogAction(IOTimerEventSource *timer);
+    void notifyScanComplete();
     IOReturn prepareSkywalkBSDInterface(ifnet_t interface);
     AirportQCAInterface *getSkywalkInterface() const { return fNetIf; }
 

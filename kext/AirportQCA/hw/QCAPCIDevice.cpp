@@ -277,11 +277,9 @@ void QCAPCIDevice::setChannel(uint32_t channel)
     }
 }
 
-void QCAPCIDevice::startScan()
+int QCAPCIDevice::startScan()
 {
-    if (fWmi) {
-        fWmi->startScan(0); /* Active scan */
-    }
+    return fWmi ? fWmi->startScan(0) : kIOReturnNotReady;
 }
 
 void QCAPCIDevice::associate(apple80211_assoc_data *assoc)
@@ -324,6 +322,7 @@ int QCAPCIDevice::transmitRaw80211(mbuf_t m)
 
 void QCAPCIDevice::watchdogCheck()
 {
+    if (fWmi) fWmi->pollEvents();
     if (fHtt) fHtt->receivePackets();
     /* Check firmware alive status */
     u32 val = read32(FW_INDICATOR_ADDRESS);
@@ -331,6 +330,11 @@ void QCAPCIDevice::watchdogCheck()
         qca_err("Watchdog detected target crash (0x%08x); initiating recovery", val);
         warmReset();
     }
+}
+
+void QCAPCIDevice::notifyScanComplete()
+{
+    if (fDriver) fDriver->notifyScanComplete();
 }
 
 void QCAPCIDevice::freePacket(mbuf_t packet)
