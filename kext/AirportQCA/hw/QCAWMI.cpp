@@ -34,6 +34,8 @@ static const u32 WMI_RX_DECAP_NATIVE_WIFI = 1;
 static const u16 WMI_EVENT_SERVICE_READY = 1;
 static const u16 WMI_EVENT_READY = 2;
 static const u32 WMI_EVENT_SCAN = 0x3001;
+static const u32 WMI_EVENT_VDEV_START_RESPONSE = 0x5001;
+static const u16 TAG_STRUCT_VDEV_START_RESPONSE = 40;
 static const u32 WMI_SCAN_EVENT_COMPLETED = 1U << 1;
 static const u32 WMI_SCAN_EVENT_START_FAILED = 1U << 6;
 static const u32 WMI_TLV_ABI_VER0 = 0x01000000;
@@ -136,7 +138,7 @@ static void appendTlv(u8 *dst, u32 *offset, u16 tag, const void *data, u16 len) 
 }
 
 QCAWMI::QCAWMI(QCAPCIDevice *pci)
-    : fPci(pci), fMemChunkCount(0)
+    : fPci(pci), fMemChunkCount(0), fEventLock(IOLockAlloc())
 {
     memset(fMemChunks, 0, sizeof(fMemChunks));
     memset(fMemReqIds, 0, sizeof(fMemReqIds));
@@ -147,12 +149,16 @@ QCAWMI::~QCAWMI() {
         fMemChunks[i]->complete();
         fMemChunks[i]->release();
     }
+    if (fEventLock) {
+        IOLockFree(fEventLock);
+        fEventLock = nullptr;
+    }
 }
 
 bool QCAWMI::init()
 {
     qca_info("Initializing WMI-TLV control plane");
-    return true;
+    return fEventLock != nullptr;
 }
 
 int QCAWMI::sendWmiCmd(u32 cmdId, const void *payload, u32 len)
@@ -172,6 +178,15 @@ int QCAWMI::sendWmiCmd(u32 cmdId, const void *payload, u32 len)
 }
 
 int QCAWMI::receiveEvent(u32 expectedEvent, void *payload, u32 *length)
+{
+    if (!fEventLock) return -1;
+    IOLockLock(fEventLock);
+    const int result = receiveEventLocked(expectedEvent, payload, length);
+    IOLockUnlock(fEventLock);
+    return result;
+}
+
+int QCAWMI::receiveEventLocked(u32 expectedEvent, void *payload, u32 *length)
 {
     QCAHTC *htc = fPci->getHTC();
     if (!htc || !payload || !length || *length < sizeof(__le32)) return -1;
@@ -201,8 +216,10 @@ int QCAWMI::receiveEvent(u32 expectedEvent, void *payload, u32 *length)
 void QCAWMI::pollEvents()
 {
     QCAHTC *htc = fPci->getHTC();
-    if (!htc) return;
+    if (!htc || !fEventLock) return;
 
+    u32 completedScans = 0;
+    IOLockLock(fEventLock);
     for (u32 count = 0; count < 16; ++count) {
         u8 event[2048];
         u32 eventLength = sizeof(event);
@@ -232,8 +249,10 @@ void QCAWMI::pollEvents()
             }
             offset += length;
         }
-        if (scanFinished) fPci->notifyScanComplete();
+        if (scanFinished) ++completedScans;
     }
+    IOLockUnlock(fEventLock);
+    for (u32 i = 0; i < completedScans; ++i) fPci->notifyScanComplete();
 }
 
 int QCAWMI::waitServiceReady()
@@ -439,7 +458,38 @@ int QCAWMI::startVdev(u32 vdevId, u32 channel, u32 chWidth,
     appendTlv(tlv, &offset, TAG_STRUCT_VDEV_START, &cmd, sizeof(cmd));
     appendTlv(tlv, &offset, TAG_STRUCT_CHANNEL, &chan, sizeof(chan));
     appendTlv(tlv, &offset, TAG_ARRAY_STRUCT, nullptr, 0);
-    return sendWmiCmd(WMI_VDEV_START_REQUEST_CMDID, tlv, offset);
+    if (sendWmiCmd(WMI_VDEV_START_REQUEST_CMDID, tlv, offset) != 0) return -1;
+
+    /* VDEV start is asynchronous in WMI-TLV. Do not create/associate the peer
+     * until firmware confirms that it accepted this channel configuration. */
+    u8 response[512];
+    u32 responseLength = sizeof(response);
+    if (receiveEvent(WMI_EVENT_VDEV_START_RESPONSE, response, &responseLength) != 0) {
+        qca_err("Timed out waiting for WMI VDEV start response");
+        return -1;
+    }
+    bool foundResponse = false;
+    u32 responseStatus = 0xFFFFFFFFU;
+    for (u32 cursor = 0; cursor + sizeof(WmiTlvHeader) <= responseLength;) {
+        WmiTlvHeader header;
+        memcpy(&header, response + cursor, sizeof(header));
+        cursor += sizeof(header);
+        const u16 tag = le16_to_cpu(header.tag);
+        const u16 length = le16_to_cpu(header.len);
+        if (length > responseLength - cursor) break;
+        if (tag == TAG_STRUCT_VDEV_START_RESPONSE && length >= 16) {
+            const u32 responseVdev = readLE32(response + cursor);
+            responseStatus = readLE32(response + cursor + 12);
+            foundResponse = responseVdev == vdevId;
+            break;
+        }
+        cursor += length;
+    }
+    if (!foundResponse || responseStatus != 0) {
+        qca_err("Firmware rejected VDEV %u start (status %u)", vdevId, responseStatus);
+        return -1;
+    }
+    return 0;
 }
 
 int QCAWMI::stopVdev(u32 vdevId)

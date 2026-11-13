@@ -62,11 +62,13 @@ public:
 private:
     int sendWmiCmd(u32 cmdId, const void *payload, u32 len);
     int receiveEvent(u32 expectedEvent, void *payload, u32 *length);
+    int receiveEventLocked(u32 expectedEvent, void *payload, u32 *length);
 
     QCAPCIDevice *fPci;
     IOBufferMemoryDescriptor *fMemChunks[16];
     u32 fMemReqIds[16];
     u32 fMemChunkCount;
+    IOLock *fEventLock;
 };
 
 #endif /* _QCA_WMI_HPP_ */
