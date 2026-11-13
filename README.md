@@ -210,11 +210,6 @@ EFI/OC/Kexts/
 > log show --predicate 'process == "kernel"' --info --last 1h | grep -i qca
 > ```
 
-### Clover / Other Bootloaders
-Place kexts in `EFI/CLOVER/kexts/Other/` and ensure:
-- `KernelAndKextPatches` → `KextsToPatch` is empty (no patching needed)
-- `Boot` → `Arguments` includes `-v` for verbose boot debugging
-
 ---
 
 ## 📚 Documentation
