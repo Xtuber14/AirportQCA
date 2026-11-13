@@ -110,8 +110,7 @@ $(AIRPORT_KEXT): $(AIRPORT_OBJS)
 	$(CXX) $(LDFLAGS) $(AIRPORT_OBJS) -o $(AIRPORT_KEXT)/Contents/MacOS/AirportQCA
 	@cp $(AIRPORT_DIR)/Info.plist $(AIRPORT_KEXT)/Contents/Info.plist
 	@cp $(AIRPORT_FW_DIR)/notice_ath10k_firmware-6.txt $(AIRPORT_KEXT)/Contents/Resources/FIRMWARE-NOTICE.txt
-	@codesign -s - --force $(AIRPORT_KEXT) 2>/dev/null || true
-	@echo "==> Successfully built AirportQCA.kext"
+	@echo "==> Successfully built unsigned AirportQCA.kext"
 
 $(BUILD_DIR)/$(AIRPORT_DIR)/%.o: $(AIRPORT_DIR)/%.cpp
 	@mkdir -p $(dir $@)
@@ -144,8 +143,7 @@ $(BT_KEXT): $(BT_OBJS)
 	@cp $(BT_DIR)/Info.plist $(BT_KEXT)/Contents/Info.plist
 	@cp $(BT_DIR)/FIRMWARE-LICENSE.txt $(BT_KEXT)/Contents/Resources/FIRMWARE-LICENSE.txt
 	@cp $(BT_DIR)/FIRMWARE-NOTICE.txt $(BT_KEXT)/Contents/Resources/FIRMWARE-NOTICE.txt
-	@codesign -s - --force $(BT_KEXT) 2>/dev/null || true
-	@echo "==> Successfully built QCABluetoothFirmware.kext"
+	@echo "==> Successfully built unsigned QCABluetoothFirmware.kext"
 
 $(BUILD_DIR)/$(BT_DIR)/%.o: $(BT_DIR)/%.cpp
 	@mkdir -p $(dir $@)
