@@ -8,6 +8,7 @@
 #include "AirportQCAInterface.hpp"
 #include "AirportQCAEthernetInterface.hpp"
 #include "hw/QCAPCIDevice.hpp"
+#include "WCL/WCL.hpp"
 
 #define super IO80211Controller
 OSDefineMetaClassAndStructors(AirportQCA, IO80211Controller)
@@ -749,6 +750,62 @@ void AirportQCA::watchdogAction(IOTimerEventSource *timer)
 void AirportQCA::notifyScanComplete()
 {
     if (fNetIf) fNetIf->postMessage(APPLE80211_M_SCAN_DONE, nullptr, 0, false);
+}
+
+void AirportQCA::reportScanBeacon(const u8 *frame, u32 frameLength, u32 channel, u32 snr)
+{
+    static const u32 kBeaconHeaderLength = 24 + 12;
+    if (!fNetIf || !frame || frameLength < kBeaconHeaderLength ||
+        frameLength > 2048 || channel < 1 || channel > 196 ||
+        (channel > 14 && channel < 36))
+        return;
+
+    const u16 frameControl = (u16)((u16)frame[0] | ((u16)frame[1] << 8));
+    const u16 subtype = frameControl & 0x00f0;
+    if ((frameControl & 0x000c) != 0 || (subtype != 0x0080 && subtype != 0x0050))
+        return;
+
+    const u8 *bssid = frame + 16;
+    if ((bssid[0] & 1) != 0) return;
+    const u8 *ies = frame + kBeaconHeaderLength;
+    const u32 ieLength = frameLength - kBeaconHeaderLength;
+    if (!AirportWCL::validIEs(ies, ieLength)) return;
+
+    AirportWCL::BeaconMetadata *metadata = static_cast<AirportWCL::BeaconMetadata *>(
+        IOMalloc(sizeof(AirportWCL::BeaconMetadata) + ieLength));
+    if (!metadata) return;
+    *metadata = {};
+    metadata->ieLength = ieLength;
+    metadata->channel = (u8)channel;
+    metadata->channelSpec = (u16)(channel | (channel > 14 ? 0xd000 : 0x1000));
+    memcpy(metadata->bssid, bssid, sizeof(metadata->bssid));
+    metadata->interval = (u16)((u16)frame[32] | ((u16)frame[33] << 8));
+    metadata->capability = (u16)((u16)frame[34] | ((u16)frame[35] << 8));
+    metadata->noise = -95;
+    metadata->snr = (int16_t)(snr > 255 ? 255 : snr);
+    metadata->rssi = metadata->snr + metadata->noise;
+    if (metadata->rssi > 0) metadata->rssi = 0;
+    metadata->flags = AirportWCL::RSSIValid;
+
+    for (u32 offset = 0; offset + 2 <= ieLength; ) {
+        const u32 size = (u32)ies[offset + 1] + 2;
+        if (size > ieLength - offset) break;
+        if (ies[offset] == 0) {
+            metadata->ssidLength = (u8)(ies[offset + 1] > sizeof(metadata->ssid)
+                ? sizeof(metadata->ssid) : ies[offset + 1]);
+            memcpy(metadata->ssid, ies + offset + 2, metadata->ssidLength);
+            metadata->flags |= AirportWCL::SSIDPresent;
+            break;
+        }
+        offset += size;
+    }
+
+    memcpy(metadata + 1, ies, ieLength);
+    metadata->ieLength = (u32)AirportWCL::selectWPA2TransitionMode(
+        reinterpret_cast<u8 *>(metadata + 1), ieLength);
+    const size_t messageLength = sizeof(*metadata) + metadata->ieLength;
+    postMessage(fNetIf, AirportWCL::ScanResult, metadata, messageLength, true);
+    IOFree(metadata, sizeof(*metadata) + ieLength);
 }
 
 bool AirportQCA::initPCIPowerManagement(IOPCIDevice *pci)

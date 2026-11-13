@@ -34,8 +34,13 @@ static const u32 WMI_RX_DECAP_NATIVE_WIFI = 1;
 static const u16 WMI_EVENT_SERVICE_READY = 1;
 static const u16 WMI_EVENT_READY = 2;
 static const u32 WMI_EVENT_SCAN = 0x3001;
+static const u32 WMI_EVENT_MGMT_RX = 0x7001;
 static const u32 WMI_EVENT_VDEV_START_RESPONSE = 0x5001;
 static const u16 TAG_STRUCT_VDEV_START_RESPONSE = 40;
+static const u16 TAG_STRUCT_MGMT_RX_HEADER = 44;
+static const u32 WMI_RX_STATUS_ERR_CRC = 0x01;
+static const u32 WMI_RX_STATUS_ERR_DECRYPT = 0x08;
+static const u32 WMI_RX_STATUS_ERR_KEY_CACHE_MISS = 0x20;
 static const u32 WMI_SCAN_EVENT_COMPLETED = 1U << 1;
 static const u32 WMI_SCAN_EVENT_START_FAILED = 1U << 6;
 static const u32 WMI_TLV_ABI_VER0 = 0x01000000;
@@ -47,6 +52,64 @@ static const u32 WMI_TLV_ABI_NS3 = 0;
 
 struct __attribute__((packed)) WmiTlvHeader { __le16 tag; __le16 len; };
 static u32 readLE32(const u8 *p);
+
+struct __attribute__((packed)) WmiMgmtRxHeader {
+    __le32 channel, snr, rate, phyMode, frameLength, status, rssi[4];
+};
+struct PendingScanBeacon {
+    u32 channel, snr, frameLength;
+    u8 frame[0];
+};
+
+static PendingScanBeacon *copyBeaconFromMgmtEvent(const u8 *event, u32 eventLength)
+{
+    if (!event || eventLength < sizeof(__le32) ||
+        (readLE32(event) & 0x00ffffff) != WMI_EVENT_MGMT_RX) return nullptr;
+
+    const WmiMgmtRxHeader *rx = nullptr;
+    const u8 *frame = nullptr;
+    u32 frameTlvLength = 0;
+    u32 offset = sizeof(__le32);
+    while (offset + sizeof(WmiTlvHeader) <= eventLength) {
+        WmiTlvHeader tlv;
+        memcpy(&tlv, event + offset, sizeof(tlv));
+        offset += sizeof(tlv);
+        const u16 tag = le16_to_cpu(tlv.tag);
+        const u16 length = le16_to_cpu(tlv.len);
+        if (length > eventLength - offset) return nullptr;
+        if (tag == TAG_STRUCT_MGMT_RX_HEADER && length >= sizeof(WmiMgmtRxHeader))
+            rx = reinterpret_cast<const WmiMgmtRxHeader *>(event + offset);
+        else if (tag == TAG_ARRAY_BYTE) {
+            frame = event + offset;
+            frameTlvLength = length;
+        }
+        offset += length;
+    }
+    if (!rx || !frame) return nullptr;
+
+    const u32 length = le32_to_cpu(rx->frameLength);
+    const u32 status = le32_to_cpu(rx->status);
+    const u32 channel = le32_to_cpu(rx->channel);
+    const u32 snr = le32_to_cpu(rx->snr);
+    if (!length || length > frameTlvLength || length > 2048 ||
+        (status & (WMI_RX_STATUS_ERR_CRC | WMI_RX_STATUS_ERR_DECRYPT |
+                   WMI_RX_STATUS_ERR_KEY_CACHE_MISS))) return nullptr;
+
+    const u8 *fc = frame;
+    if (length < 2) return nullptr;
+    const u16 frameControl = (u16)((u16)fc[0] | ((u16)fc[1] << 8));
+    const u16 subtype = frameControl & 0x00f0;
+    if ((frameControl & 0x000c) != 0 || (subtype != 0x0080 && subtype != 0x0050))
+        return nullptr;
+
+    auto copy = static_cast<PendingScanBeacon *>(IOMalloc(sizeof(PendingScanBeacon) + length));
+    if (!copy) return nullptr;
+    copy->channel = channel;
+    copy->snr = snr;
+    copy->frameLength = length;
+    memcpy(copy->frame, frame, length);
+    return copy;
+}
 
 static bool isScanCompleteEvent(const u8 *event, u32 length)
 {
@@ -248,6 +311,8 @@ void QCAWMI::pollEvents()
     if (!htc || !fEventLock) return;
 
     u32 completedScans = 0;
+    PendingScanBeacon *beacons[16] = {};
+    u32 beaconCount = 0;
     IOLockLock(fEventLock);
     for (u32 count = 0; count < 16; ++count) {
         u8 event[2048];
@@ -256,6 +321,13 @@ void QCAWMI::pollEvents()
         if (eventLength < sizeof(__le32)) continue;
 
         const u32 eventId = readLE32(event) & 0x00ffffff;
+        if (eventId == WMI_EVENT_MGMT_RX) {
+            if (beaconCount < sizeof(beacons) / sizeof(beacons[0])) {
+                PendingScanBeacon *beacon = copyBeaconFromMgmtEvent(event, eventLength);
+                if (beacon) beacons[beaconCount++] = beacon;
+            }
+            continue;
+        }
         if (eventId != WMI_EVENT_SCAN) {
             continue;
         }
@@ -281,6 +353,12 @@ void QCAWMI::pollEvents()
         if (scanFinished) ++completedScans;
     }
     IOLockUnlock(fEventLock);
+    for (u32 i = 0; i < beaconCount; ++i) {
+        PendingScanBeacon *beacon = beacons[i];
+        fPci->reportScanBeacon(beacon->frame, beacon->frameLength,
+                               beacon->channel, beacon->snr);
+        IOFree(beacon, sizeof(*beacon) + beacon->frameLength);
+    }
     for (u32 i = 0; i < completedScans; ++i) fPci->notifyScanComplete();
 }
 

@@ -62,6 +62,7 @@ public:
     void watchdogCheck();
     void freePacket(mbuf_t packet);
     void notifyScanComplete();
+    void reportScanBeacon(const u8 *frame, u32 frameLength, u32 channel, u32 snr);
 
     /* Subsystem access */
     QCACopyEngine* getCopyEngine() const { return fCopyEngine; }

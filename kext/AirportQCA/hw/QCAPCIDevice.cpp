@@ -340,6 +340,11 @@ void QCAPCIDevice::notifyScanComplete()
     if (fDriver) fDriver->notifyScanComplete();
 }
 
+void QCAPCIDevice::reportScanBeacon(const u8 *frame, u32 frameLength, u32 channel, u32 snr)
+{
+    if (fDriver) fDriver->reportScanBeacon(frame, frameLength, channel, snr);
+}
+
 void QCAPCIDevice::freePacket(mbuf_t packet)
 {
     if (packet && fDriver) fDriver->freePacket(packet);
