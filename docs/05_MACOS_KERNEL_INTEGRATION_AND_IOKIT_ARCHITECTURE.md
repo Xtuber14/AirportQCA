@@ -167,14 +167,52 @@ The kext matches against `IOUSBHostDevice` with a high `IOProbeScore` (e.g. 5000
 2. **Open**: Kext calls `provider->open(this)` to gain exclusive USB endpoint control.
 3. **Firmware Injection**:
    - Queries `QCA_GET_TARGET_VERSION` via EP0 control transfer.
+   - Queries `QCA_CHECK_STATUS`: If `(status & (QCA_PATCH_UPDATED | QCA_SYSCFG_UPDATED))` is already set, skips uploading immediately.
    - Downloads `rampatch_usb_00000302.bin` via EP0 (header) and EP2 OUT (bulk body).
    - Downloads `nvm_usb_00000302.bin` via EP0 and EP2 OUT.
-   - Checks `QCA_CHECK_STATUS` for `QCA_PATCH_UPDATED | QCA_SYSCFG_UPDATED`.
-4. **Soft Reset**: Issues USB controller reset.
-5. **Close & Detach**:
+4. **Transition without Hardware Bus Reset**:
+   - In Qualcomm Rome 3.2 (0x00000302), the patch executes in RAM autonomously without issuing an `IOUSBHostDevice::reset()`.
+   - **Critical Engineering Insight**: Never call hardware `fDevice->reset()` on modern macOS! A hardware port reset disconnects the USB device, destroys the existing `IOUSBHostDevice` node along with its properties, and causes the driver to loop infinitely.
+5. **Handoff & Detach**:
    - Kext sets `provider->setProperty("FirmwareLoaded", kOSBooleanTrue)`.
-   - On macOS Monterey+, sets device name to `"Bluetooth USB Host Controller"`.
+   - On macOS Monterey through Tahoe (Darwin 21 - 26+), sets device name to `"Bluetooth USB Host Controller"`.
    - Calls `provider->close(this)`.
 6. **Native Attachment**:
-   - macOS's native `BroadcomBluetoothHostControllerUSBTransport` or generic USB Bluetooth host controller driver matches the now-initialized hardware.
+   - macOS's native `IOBluetoothHostControllerUSBTransport` matches the now-initialized Rome controller.
    - System recognizes a genuine Bluetooth 4.2 / 5.0 Host Controller with standard HCI command support!
+
+---
+
+## 7. macOS Tahoe (Darwin 25/26) Kernel Architecture & OpenCore Requirements
+
+### 7.1 The macOS Tahoe Wi-Fi Landscape
+In macOS Sonoma (14.x), Sequoia (15.x), and **macOS Tahoe (16.x)**, Apple completely removed legacy `com.apple.iokit.IO80211Family` from `BootKernelExtensions.kc`. Modern macOS relies exclusively on the **IOSkywalkFamily** network plane.
+
+For a native Wi-Fi kext to be injected without OpenCore prelinker errors (`Invalid Parameter`), the following strict rules apply:
+
+1. **`OSBundleLibraries` Version Alignment**:
+   - `com.apple.iokit.IO80211Family`: Must declare version `1.5.0` (matching OCLP's `IO80211FamilyLegacy.kext`), NOT `6.0`. Declaring `6.0` causes OpenCore prelinked dependency check failure (`EFI_INVALID_PARAMETER`).
+   - `com.apple.driver.corecapture`: Declared as `1.0.0`.
+   - `com.apple.iokit.IOSkywalkFamily`: Declared as `1.0`.
+   - `com.apple.iokit.IONetworkingFamily`: Declared as `3.2`.
+   - `com.apple.iokit.IOPCIFamily`: Declared as `2.9`.
+   - `com.apple.kpi.*` (`bsd`, `iokit`, `libkern`, `mach`): Declared as `16.7`.
+
+2. **PCIe Tunnel Compatibility (`IOPCITunnelCompatible`)**:
+   macOS 15/16 strictly enforces tunnel compatibility flags on PCI personalities. Every driver personality in `Info.plist` must specify:
+   ```xml
+   <key>IOPCITunnelCompatible</key>
+   <true/>
+   ```
+
+3. **OpenCore `config.plist` Setup for Native AirPort on macOS Tahoe**:
+   - **Kernel -> Block**:
+     - Block `com.apple.iokit.IOSkywalkFamily` (Strategy: `Exclude`) so the vanilla Skywalk driver does not panic against legacy 802.11 interfaces.
+   - **Kernel -> Add**:
+     - `IOSkywalkFamily.kext` (Patched OCLP companion)
+     - `IO80211FamilyLegacy.kext` (Version 1.5.0)
+     - `AirportQCA.kext`
+     - `QCABluetoothFirmware.kext`
+
+4. **Zero-Patch Fallback (IOEthernetController Mode)**:
+   For users booting pure vanilla macOS Tahoe without OCLP patches or blocked Skywalk, a driver targeting `IOEthernetController` (`IONetworkingFamily` only, exactly like `itlwm.kext`) can load with zero dependencies on `IO80211Family`. In this mode, scanning and AP joining are managed via the userspace `HeliPort` utility.
