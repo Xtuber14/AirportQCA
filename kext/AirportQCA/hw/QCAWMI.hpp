@@ -69,6 +69,7 @@ private:
     u32 fMemReqIds[16];
     u32 fMemChunkCount;
     IOLock *fEventLock;
+    u32 fPendingScanCompletions;
 };
 
 #endif /* _QCA_WMI_HPP_ */

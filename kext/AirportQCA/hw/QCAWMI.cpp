@@ -46,6 +46,28 @@ static const u32 WMI_TLV_ABI_NS2 = 0;
 static const u32 WMI_TLV_ABI_NS3 = 0;
 
 struct __attribute__((packed)) WmiTlvHeader { __le16 tag; __le16 len; };
+static u32 readLE32(const u8 *p);
+
+static bool isScanCompleteEvent(const u8 *event, u32 length)
+{
+    if (!event || length < sizeof(__le32) ||
+        (readLE32(event) & 0x00ffffff) != WMI_EVENT_SCAN) return false;
+    u32 offset = sizeof(__le32);
+    while (offset + sizeof(WmiTlvHeader) <= length) {
+        WmiTlvHeader header;
+        memcpy(&header, event + offset, sizeof(header));
+        offset += sizeof(header);
+        const u16 tag = le16_to_cpu(header.tag);
+        const u16 tlvLength = le16_to_cpu(header.len);
+        if (tlvLength > length - offset) return false;
+        if (tag == TAG_STRUCT_SCAN_EVENT && tlvLength >= 24) {
+            const u32 eventType = readLE32(event + offset);
+            return (eventType & (WMI_SCAN_EVENT_COMPLETED | WMI_SCAN_EVENT_START_FAILED)) != 0;
+        }
+        offset += tlvLength;
+    }
+    return false;
+}
 struct __attribute__((packed)) WmiAbiVersion {
     __le32 ver0, ver1, ns0, ns1, ns2, ns3;
 };
@@ -138,7 +160,7 @@ static void appendTlv(u8 *dst, u32 *offset, u16 tag, const void *data, u16 len) 
 }
 
 QCAWMI::QCAWMI(QCAPCIDevice *pci)
-    : fPci(pci), fMemChunkCount(0), fEventLock(IOLockAlloc())
+    : fPci(pci), fMemChunkCount(0), fEventLock(IOLockAlloc()), fPendingScanCompletions(0)
 {
     memset(fMemChunks, 0, sizeof(fMemChunks));
     memset(fMemReqIds, 0, sizeof(fMemReqIds));
@@ -182,7 +204,10 @@ int QCAWMI::receiveEvent(u32 expectedEvent, void *payload, u32 *length)
     if (!fEventLock) return -1;
     IOLockLock(fEventLock);
     const int result = receiveEventLocked(expectedEvent, payload, length);
+    const u32 pendingScanCompletions = fPendingScanCompletions;
+    fPendingScanCompletions = 0;
     IOLockUnlock(fEventLock);
+    for (u32 i = 0; i < pendingScanCompletions; ++i) fPci->notifyScanComplete();
     return result;
 }
 
@@ -198,6 +223,10 @@ int QCAWMI::receiveEventLocked(u32 expectedEvent, void *payload, u32 *length)
             if (eventLength < sizeof(__le32)) return -1;
             u32 eventId = readLE32(event) & 0x00ffffff;
             if (eventId != expectedEvent) {
+                if (isScanCompleteEvent(event, eventLength)) {
+                    ++fPendingScanCompletions;
+                    qca_info("Firmware scan completed while waiting for WMI event 0x%x", expectedEvent);
+                }
                 qca_warn("Ignoring WMI event 0x%x while waiting for 0x%x", eventId, expectedEvent);
             } else {
                 u32 dataLength = eventLength - sizeof(__le32);
