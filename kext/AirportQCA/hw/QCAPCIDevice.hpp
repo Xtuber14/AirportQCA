@@ -32,21 +32,42 @@ public:
     void start();
     void stop();
 
-    /* MMIO Register Access */
-    inline u32 read32(u32 offset) {
+    /* MMIO Register Access.
+       The QCA9377 SoC sleeps on its own (ath10k pci_ps = true): while
+       asleep its register file is unpowered and reads return zero. Every
+       access must therefore wake the SoC first and wait for the RTC
+       state to report ON. */
+    inline u32 read32Raw(u32 offset) {
         if (!fMmioBase) return 0xFFFFFFFF;
         return OSReadLittleInt32(fMmioBase, offset);
     }
 
-    inline void write32(u32 offset, u32 val) {
+    inline void write32Raw(u32 offset, u32 val) {
         if (!fMmioBase) return;
         OSWriteLittleInt32(fMmioBase, offset, val);
     }
+
+    inline u32 read32(u32 offset) {
+        wakeTarget();
+        return read32Raw(offset);
+    }
+
+    inline void write32(u32 offset, u32 val) {
+        wakeTarget();
+        write32Raw(offset, val);
+    }
+
+    bool wakeTarget();
+    void markTargetAsleep();
 
     /* Hardware Resets */
     int warmReset();
     int chipReset();
     int waitForTargetInit();
+
+    /* Target bring-up helpers */
+    int enablePllClock();
+    int configureTarget();
 
     /* MAC Address */
     void getMacAddress(uint8_t *mac);
@@ -85,6 +106,7 @@ private:
 
     uint8_t          fMacAddr[6];
     bool             fFwRunning;
+    bool             fTargetAwake;
 };
 
 #endif /* _QCA_PCI_DEVICE_HPP_ */

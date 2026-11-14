@@ -206,6 +206,31 @@ int QCABMI::writeSocRegister(u32 address, u32 value)
     return exchangeMessage(&req, sizeof(req), nullptr, nullptr);
 }
 
+int QCABMI::readSocRegister(u32 address, u32 *value)
+{
+    if (!value) return -1;
+
+    struct {
+        __le32 cmd;
+        __le32 addr;
+    } req;
+
+    struct {
+        __le32 val;
+    } resp;
+
+    req.cmd = cpu_to_le32(BMI_READ_SOC_REGISTER);
+    req.addr = cpu_to_le32(address);
+    u32 respLen = sizeof(resp);
+
+    int ret = exchangeMessage(&req, sizeof(req), &resp, &respLen);
+    if (ret == 0 && respLen >= sizeof(resp)) {
+        *value = le32_to_cpu(resp.val);
+        return 0;
+    }
+    return -1;
+}
+
 int QCABMI::done()
 {
     struct {

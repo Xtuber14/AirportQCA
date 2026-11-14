@@ -25,6 +25,7 @@ public:
     int execute(u32 address, u32 param, u32 *result = nullptr);
     int setAppStart(u32 address);
     int writeSocRegister(u32 address, u32 value);
+    int readSocRegister(u32 address, u32 *value);
     int done();
 
 private:
