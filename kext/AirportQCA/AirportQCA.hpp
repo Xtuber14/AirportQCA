@@ -9,6 +9,13 @@
 #define _AIRPORT_QCA_HPP_
 
 #include "Apple80211/Apple80211.h"
+#ifdef IO80211FAMILY_V2
+#if __IO80211_TARGET == __MAC_15_2
+#include "Apple80211/macOS15/FaultReporter.h"
+#else
+#include "Apple80211/macOS26/FaultReporter.h"
+#endif
+#endif
 #include "include/qca_compat.h"
 #include "include/qca_hw.h"
 #include "include/qca_regs.h"
@@ -23,6 +30,7 @@
 class AirportQCAInterface;
 class AirportQCAEthernetInterface;
 class QCAPCIDevice;
+class QCAPCIProvider;
 
 enum {
     kQCAPowerStateOff = 0,
@@ -78,6 +86,10 @@ public:
 
     virtual IOWorkLoop* getWorkLoop() const APPLE_KEXT_OVERRIDE;
     virtual bool createWorkLoop() APPLE_KEXT_OVERRIDE;
+#ifdef IO80211FAMILY_V2
+    virtual bool createWorkQueue() APPLE_KEXT_OVERRIDE;
+    virtual IO80211WorkQueue* getWorkQueue() const APPLE_KEXT_OVERRIDE;
+#endif
 
     virtual bool setLinkStatus(
         UInt32 status,
@@ -101,6 +113,8 @@ public:
     virtual IOReturn setGET_DEBUG_INFO(IO80211SkywalkInterface *, apple80211_debug_command *) APPLE_KEXT_OVERRIDE;
     virtual CCLogStream *getLogger() const APPLE_KEXT_OVERRIDE;
     virtual CommonFaultReporter *getFaultReporterFromDriver() APPLE_KEXT_OVERRIDE;
+    virtual bool getLogPipes(CCPipe **logPipe, CCPipe **eventPipe,
+                             CCPipe **snapshotsPipe) APPLE_KEXT_OVERRIDE;
     virtual UInt32 hardwareOutputQueueDepth() APPLE_KEXT_OVERRIDE;
     virtual SInt32 performCountryCodeOperation(IO80211CountryCodeOp) APPLE_KEXT_OVERRIDE;
     virtual SInt32 monitorModeSetEnabled(bool enabled, unsigned int channel) APPLE_KEXT_OVERRIDE;
@@ -137,6 +151,10 @@ public:
 private:
     bool createMediumTables(const IONetworkMedium **primary);
     bool initPCIPowerManagement(IOPCIDevice *pci);
+#ifdef IO80211FAMILY_V2
+    bool initCCLogs();
+    void releaseCCLogs();
+#endif
     void interfaceSetChannel(UInt32 channel);
     void interfaceSetPower(bool enabled);
 
@@ -144,6 +162,7 @@ private:
     AirportQCAInterface       *fNetIf;
     AirportQCAEthernetInterface *fBSDInterface;
     IOWorkLoop                *fWorkLoop;
+    IO80211WorkQueue          *fWorkQueue;
     IOCommandGate             *fCommandGate;
     IOFilterInterruptEventSource *fInterruptSource;
     IOTimerEventSource        *fWatchdogTimer;
@@ -157,6 +176,17 @@ private:
 
     /* QCA Hardware state */
     void                      *fHalDevice;
+
+#ifdef IO80211FAMILY_V2
+    /* Tahoe WCL logging and fault-reporting hooks */
+    CCPipe                    *fDriverLogPipe;
+    CCPipe                    *fDriverDataPathPipe;
+    CCPipe                    *fDriverSnapshotsPipe;
+    CCLogStream               *fDriverLogger;
+    CCStream                  *fDriverFaultStream;
+    CCFaultReporter           *fDriverCoreFaultReporter;
+    IO80211FaultReporter      *fDriverFaultReporter;
+#endif
 };
 
 #endif /* _AIRPORT_QCA_HPP_ */

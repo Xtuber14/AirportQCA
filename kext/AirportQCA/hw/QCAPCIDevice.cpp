@@ -82,6 +82,7 @@ bool QCAPCIDevice::init(IOPCIDevice *pciNub, AirportQCA *driver)
     fDriver = driver;
 
     /* Map BAR 0 MMIO */
+    fPciNub->setProperty("QCAStartStage", "hal-map");
     fMmioMap = fPciNub->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
     if (!fMmioMap) {
         qca_err("Failed to map BAR0 MMIO space");
@@ -92,6 +93,7 @@ bool QCAPCIDevice::init(IOPCIDevice *pciNub, AirportQCA *driver)
              fMmioBase, fMmioMap->getLength());
 
     /* Initialize Copy Engine */
+    fPciNub->setProperty("QCAStartStage", "hal-ce");
     fCopyEngine = new QCACopyEngine(this);
     if (!fCopyEngine || !fCopyEngine->initPipes()) {
         qca_err("Failed to initialize Copy Engine");
@@ -104,6 +106,7 @@ bool QCAPCIDevice::init(IOPCIDevice *pciNub, AirportQCA *driver)
     fHtt = new QCAHTT(this);
 
     /* Reset and boot target firmware */
+    fPciNub->setProperty("QCAStartStage", "hal-fw");
     if (!bootFirmware()) {
         qca_err("Firmware boot sequence failed");
         return false;
@@ -165,6 +168,7 @@ bool QCAPCIDevice::bootFirmware()
 {
     /* 1. Reset chip */
     chipReset();
+    fPciNub->setProperty("QCAStartStage", "fw-wait");
 
     /* 2. Wait for ROM bootloader */
     if (waitForTargetInit() != 0) {
@@ -174,12 +178,14 @@ bool QCAPCIDevice::bootFirmware()
 
     /* BMI commands and responses are transported on CE0/CE1. */
     fCopyEngine->startPipes();
+    fPciNub->setProperty("QCAStartStage", "fw-target-info");
 
     /* 3. Query ROM target info before programming board data. */
     struct bmi_target_info info;
     if (fBmi->getTargetInfo(&info) != 0) return false;
     qca_info("Target Xtensa CPU active: version 0x%08x type 0x%08x", info.version, info.type);
 
+    fPciNub->setProperty("QCAStartStage", "fw-board");
     /* board.bin is ath10k API-1 calibration data for the QCA9377 hw1.0 target. */
     u32 boardAddress = 0;
     u32 boardInitialized = 1;
@@ -191,6 +197,7 @@ bool QCAPCIDevice::bootFirmware()
         return false;
     }
 
+    fPciNub->setProperty("QCAStartStage", "fw-otp");
     /* Parse the ath10k firmware container and upload OTP then operational image. */
     const u8 *otp = nullptr, *image = nullptr;
     u32 otpLen = 0, imageLen = 0;
@@ -208,6 +215,7 @@ bool QCAPCIDevice::bootFirmware()
     }
 
     /* 4. Boost clock PLL to 176 MHz */
+    fPciNub->setProperty("QCAStartStage", "fw-clock");
     if (fBmi->writeSocRegister(RTC_SOC_BASE_ADDRESS + RTC_POWER_REG_ADDRESS, RTC_POWER_REG_V_ON) != 0)
         return false;
 

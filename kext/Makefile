@@ -64,6 +64,7 @@ AIRPORT_SRCS := \
 	$(AIRPORT_DIR)/AirportQCA.cpp \
 	$(AIRPORT_DIR)/AirportQCAInterface.cpp \
 	$(AIRPORT_DIR)/AirportQCAEthernetInterface.cpp \
+	$(AIRPORT_DIR)/QCAPCIProvider.cpp \
 	$(AIRPORT_DIR)/hw/QCAPCIDevice.cpp \
 	$(AIRPORT_DIR)/hw/QCACopyEngine.cpp \
 	$(AIRPORT_DIR)/hw/QCABMI.cpp \

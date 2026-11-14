@@ -4,7 +4,9 @@
 //
 
 #include "AirportQCA.hpp"
+#include "QCAPCIProvider.hpp"
 #include <IOKit/network/IOOutputQueue.h>
+#include <IOKit/pwr_mgt/IOPM.h>
 #include "AirportQCAInterface.hpp"
 #include "AirportQCAEthernetInterface.hpp"
 #include "hw/QCAPCIDevice.hpp"
@@ -23,6 +25,17 @@ static IOReturn qcaPrepareBSDInterface(OSObject *owner, void *arg0, void *, void
         : kIOReturnNotReady;
 }
 
+static void qcaSetStartStage(IORegistryEntry *entry, const char *stage)
+{
+    /* Start-stage breadcrumb on the persistent provider node: driver
+       IOLog output only reaches the boot console, never the unified
+       log, so after a failed boot the last QCAStartStage visible in
+       ioreg marks the exact step that failed. */
+    if (entry) {
+        entry->setProperty("QCAStartStage", stage);
+    }
+}
+
 bool AirportQCA::init(OSDictionary *properties)
 {
     if (!super::init(properties)) {
@@ -33,6 +46,7 @@ bool AirportQCA::init(OSDictionary *properties)
     fNetIf = nullptr;
     fBSDInterface = nullptr;
     fWorkLoop = nullptr;
+    fWorkQueue = nullptr;
     fCommandGate = nullptr;
     fInterruptSource = nullptr;
     fWatchdogTimer = nullptr;
@@ -43,6 +57,16 @@ bool AirportQCA::init(OSDictionary *properties)
     fChannel = 1;
     fRssi = -50;
     fNoise = -95;
+
+#ifdef IO80211FAMILY_V2
+    fDriverLogPipe = nullptr;
+    fDriverDataPathPipe = nullptr;
+    fDriverSnapshotsPipe = nullptr;
+    fDriverLogger = nullptr;
+    fDriverFaultStream = nullptr;
+    fDriverCoreFaultReporter = nullptr;
+    fDriverFaultReporter = nullptr;
+#endif
 
     /* Default fallback MAC address (overridden by hardware BDF / OTP during boot) */
     fMacAddress.bytes[0] = 0x00;
@@ -58,9 +82,20 @@ bool AirportQCA::init(OSDictionary *properties)
 
 void AirportQCA::free()
 {
+#ifdef IO80211FAMILY_V2
+    releaseCCLogs();
+#endif
     if (fHalDevice) {
         delete static_cast<QCAPCIDevice*>(fHalDevice);
         fHalDevice = nullptr;
+    }
+    if (fWorkLoop) {
+        fWorkLoop->release();
+        fWorkLoop = nullptr;
+    }
+    if (fWorkQueue) {
+        fWorkQueue->release();
+        fWorkQueue = nullptr;
     }
     super::free();
 }
@@ -71,16 +106,17 @@ IOService* AirportQCA::probe(IOService *provider, SInt32 *score)
         return nullptr;
     }
 
-    IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
-    if (!pci) {
+    QCAPCIProvider *pciProvider = OSDynamicCast(QCAPCIProvider, provider);
+    if (!pciProvider || !pciProvider->pciNub) {
         return nullptr;
     }
 
-    UInt16 vendorId = pci->configRead16(kIOPCIConfigVendorID);
-    UInt16 deviceId = pci->configRead16(kIOPCIConfigDeviceID);
+    UInt16 vendorId = pciProvider->pciNub->configRead16(kIOPCIConfigVendorID);
+    UInt16 deviceId = pciProvider->pciNub->configRead16(kIOPCIConfigDeviceID);
 
     if (vendorId == QCA9377_PCI_VENDOR_ID && deviceId == QCA9377_1_0_DEVICE_ID) {
         qca_info("probe: matched Qualcomm Atheros QCA9377 (%04x:%04x)", vendorId, deviceId);
+        pciProvider->setProperty("QCAStartStage", "controller-matched");
         *score += 2000;
         return this;
     }
@@ -91,10 +127,37 @@ IOService* AirportQCA::probe(IOService *provider, SInt32 *score)
 bool AirportQCA::createWorkLoop()
 {
     if (!fWorkLoop) {
-        fWorkLoop = IOWorkLoop::workLoop();
+        if (fWorkQueue) {
+            /* Alias the shared WCL work queue as the controller work loop;
+               the extra retain keeps stop()/free()'s two releases balanced. */
+            fWorkQueue->retain();
+            fWorkLoop = fWorkQueue;
+        } else {
+            fWorkLoop = IOWorkLoop::workLoop();
+        }
     }
     return (fWorkLoop != nullptr);
 }
+
+#ifdef IO80211FAMILY_V2
+bool AirportQCA::createWorkQueue()
+{
+    /* The QCAPCIProvider creates the shared IO80211WorkQueue at its early
+       start and AirportQCA::start shares it; only create one here if the
+       provider's queue was not available, so the single release in
+       stop()/free() stays balanced. It must never replace fWorkLoop
+       directly — createWorkLoop() aliases it with a retain. */
+    if (!fWorkQueue) {
+        fWorkQueue = IO80211WorkQueue::workQueue();
+    }
+    return (fWorkQueue != nullptr);
+}
+
+IO80211WorkQueue* AirportQCA::getWorkQueue() const
+{
+    return fWorkQueue;
+}
+#endif
 
 IOWorkLoop* AirportQCA::getWorkLoop() const
 {
@@ -103,13 +166,48 @@ IOWorkLoop* AirportQCA::getWorkLoop() const
 
 bool AirportQCA::start(IOService *provider)
 {
-    if (!super::start(provider)) {
+    /* The controller personality is gated on IOResourceMatch=IOBSD and
+       matches the QCAPCIProvider instance, the way AirportItlwm matches
+       its IOPCIEDeviceWrapper. The provider owns the PCI nub and the
+       IO80211WorkQueue created at its early start. */
+    QCAPCIProvider *pciProvider = OSDynamicCast(QCAPCIProvider, provider);
+    if (!pciProvider || !pciProvider->pciNub) {
+        qca_err("start: provider is not a QCAPCIProvider with a PCI nub");
+        return false;
+    }
+    fPciNub = pciProvider->pciNub;
+    qcaSetStartStage(pciProvider, "start-entered");
+
+#ifdef IO80211FAMILY_V2
+    /* Share the provider's IO80211WorkQueue: it becomes the controller
+       work loop and runs the WCL fault reporter. Each pointer carries
+       exactly one retain (share + alias), released once in stop()/free(). */
+    if (!fWorkQueue && pciProvider->workQueue) {
+        fWorkQueue = pciProvider->workQueue;
+        fWorkQueue->retain();
+    }
+    if (!createWorkLoop()) {
+        qca_err("Failed to create workloop");
         return false;
     }
 
-    fPciNub = OSDynamicCast(IOPCIDevice, provider);
-    if (!fPciNub) {
-        stop(provider);
+    qcaSetStartStage(pciProvider, "wcl-init");
+    /* Full WCL init runs at this late stage — the IOResourceMatch=IOBSD
+       gate means the WCL/Skywalk environment exists here, the same stage
+       AirportItlwm runs its initCCLogs(). The parent's createIOReporters
+       consumes getLogger()/getLogPipes() during IO80211Controller::start,
+       so everything must be ready before super::start. */
+    if (!initCCLogs()) {
+        releaseCCLogs();
+        return false;
+    }
+#endif
+
+    qcaSetStartStage(pciProvider, "super-start");
+    if (!super::start(provider)) {
+#ifdef IO80211FAMILY_V2
+        releaseCCLogs();
+#endif
         return false;
     }
 
@@ -117,13 +215,23 @@ bool AirportQCA::start(IOService *provider)
     fPciNub->setBusMasterEnable(true);
     fPciNub->setMemoryEnable(true);
     fPciNub->setIOEnable(true);
+    fPciNub->configWrite8(0x41, 0);
 
-    if (!createWorkLoop()) {
-        qca_err("Failed to create workloop");
-        stop(provider);
-        return false;
+    /* Bring the device out of any low-power state before touching the
+       hardware and register device power management now — the same
+       sequence AirportItlwm runs before its HAL attach. Failures are
+       logged but non-fatal so the stage breadcrumb still records how
+       far the hardware bring-up gets. */
+    qcaSetStartStage(pciProvider, "power-domain");
+    IOPowerConnection *powerParent = (IOPowerConnection *) getParentEntry(gIOPowerPlane);
+    if (powerParent && fPciNub->requestPowerDomainState(
+            kIOPMPowerOn, powerParent, IOPMLowestState) != IOPMNoErr) {
+        qca_err("requestPowerDomainState failed");
     }
+    qcaSetStartStage(pciProvider, "pm");
+    initPCIPowerManagement(fPciNub);
 
+    qcaSetStartStage(pciProvider, "command-gate");
     fCommandGate = IOCommandGate::commandGate(this);
     if (!fCommandGate) {
         qca_err("Failed to create command gate");
@@ -132,6 +240,7 @@ bool AirportQCA::start(IOService *provider)
     }
     fWorkLoop->addEventSource(fCommandGate);
 
+    qcaSetStartStage(pciProvider, "mediums");
     const IONetworkMedium *primaryMedium = nullptr;
     if (!createMediumTables(&primaryMedium) ||
         !setCurrentMedium(primaryMedium) ||
@@ -141,6 +250,7 @@ bool AirportQCA::start(IOService *provider)
         return false;
     }
 
+    qcaSetStartStage(pciProvider, "hal-init");
     /* Initialize hardware layer */
     auto *hal = new QCAPCIDevice();
     if (!hal || !hal->init(fPciNub, this)) {
@@ -150,6 +260,7 @@ bool AirportQCA::start(IOService *provider)
         return false;
     }
     fHalDevice = hal;
+    qcaSetStartStage(pciProvider, "hal-done");
 
     /* Keep the valid fallback until the HAL can read a provisioned address. */
     uint8_t hardwareAddress[sizeof(fMacAddress.bytes)] = {};
@@ -159,6 +270,7 @@ bool AirportQCA::start(IOService *provider)
     if (macBits && !(hardwareAddress[0] & 1))
         memcpy(fMacAddress.bytes, hardwareAddress, sizeof(hardwareAddress));
 
+    qcaSetStartStage(pciProvider, "netif-init");
     /* Register the Tahoe Skywalk protocol and its BSD-facing Ethernet interface. */
     fNetIf = new AirportQCAInterface;
     if (!fNetIf || !fNetIf->init()) {
@@ -194,12 +306,14 @@ bool AirportQCA::start(IOService *provider)
     memcpy(fNetIf->mExpansionData->fRegistrationInfo, &registrationInfo, sizeof(registrationInfo));
     memcpy(fNetIf->mExpansionData2->fRegistrationInfo, &registrationInfo, sizeof(registrationInfo));
     fNetIf->deferBSDAttach(true);
+    qcaSetStartStage(pciProvider, "netif-start");
     if (!fNetIf->start(this)) {
         qca_err("Failed to start Tahoe Skywalk interface");
         stop(provider);
         return false;
     }
 
+    qcaSetStartStage(pciProvider, "watchdog");
     /* Setup Watchdog Timer */
     fWatchdogTimer = IOTimerEventSource::timerEventSource(
         this,
@@ -210,12 +324,10 @@ bool AirportQCA::start(IOService *provider)
         fWatchdogTimer->setTimeoutMS(kWatchDogPeriodMs);
     }
 
-    /* Register power management */
-    initPCIPowerManagement(fPciNub);
-
     setLinkStatus(kIONetworkLinkValid);
     registerService();
     if (fBSDInterface) fBSDInterface->registerService();
+    qcaSetStartStage(pciProvider, "registered");
 
     qca_info("AirportQCA started successfully with native AirPort interface");
     return true;
@@ -270,9 +382,20 @@ void AirportQCA::stop(IOService *provider)
         fHalDevice = nullptr;
     }
 
+#ifdef IO80211FAMILY_V2
+    releaseCCLogs();
+#endif
+
+    /* Each pointer carries one retain: fWorkLoop aliases the shared queue
+       (retain in createWorkLoop) and fWorkQueue is the shared queue
+       (retain in start). Release both. */
     if (fWorkLoop) {
         fWorkLoop->release();
         fWorkLoop = nullptr;
+    }
+    if (fWorkQueue) {
+        fWorkQueue->release();
+        fWorkQueue = nullptr;
     }
 
     super::stop(provider);
@@ -810,6 +933,28 @@ void AirportQCA::reportScanBeacon(const u8 *frame, u32 frameLength, u32 channel,
 
 bool AirportQCA::initPCIPowerManagement(IOPCIDevice *pci)
 {
+    /* Mirror AirportItlwm::initPCIPowerManagment: rewrite the command
+       register (BusMaster | Memory | MemWrInvalidate, IO space off) and
+       force the device to D0 through the PCI Power Management
+       capability, settling 10 ms before the first MMIO access. Without
+       the PMCSR write the QCA9377 stays in the BIOS ACPI power state
+       and every target register read returns 0xFFFFFFFF. */
+    UInt16 reg16 = pci->configRead16(kIOPCIConfigCommand);
+    reg16 |= (kIOPCICommandBusMaster |
+              kIOPCICommandMemorySpace |
+              kIOPCICommandMemWrInvalidate);
+    reg16 &= ~kIOPCICommandIOSpace;
+    pci->configWrite16(kIOPCIConfigCommand, reg16);
+
+    UInt8 pmPCICapPtr = 0;
+    pci->findPCICapability(kIOPCIPowerManagementCapability, &pmPCICapPtr);
+    if (pmPCICapPtr) {
+        pci->configWrite16(pmPCICapPtr + 4, 0x8000);
+        IOSleep(10);
+    } else {
+        qca_info("No PCI Power Management capability; device assumed D0");
+    }
+
     PMinit();
     pci->joinPMtree(this);
     registerPowerDriver(this, nullptr, 0);
@@ -846,6 +991,133 @@ IOReturn AirportQCA::prepareSkywalkBSDInterface(ifnet_t interface)
 }
 
 #ifdef IO80211FAMILY_V2
+bool AirportQCA::initCCLogs()
+{
+    if (fDriverLogger) {
+        return true;
+    }
+
+    /* Runs at the controller's late start stage: the IOResourceMatch=IOBSD
+       gate on the AirportQCA personality keeps this out of the early boot
+       stage, so the WCL/Skywalk environment exists here — the same stage
+       AirportItlwm runs its initCCLogs(). The parent's createIOReporters
+       consumes getLogger()/getLogPipes() during IO80211Controller::start,
+       so everything must be ready before super::start. */
+    if (!createWorkQueue() || !getWorkLoop()) {
+        qca_err("WCL work queue unavailable");
+        return false;
+    }
+
+    CCPipeOptions logOptions = {};
+    logOptions.pipe_type = 0;
+    logOptions.log_data_type = 1;
+    logOptions.pipe_size = 0x200000;
+    logOptions.min_log_size_notify = 0xccccc;
+    logOptions.notify_threshold = 1000;
+    strlcpy(logOptions.file_name, "AirportQCA_Logs", sizeof(logOptions.file_name));
+    snprintf(logOptions.name, sizeof(logOptions.name), "wlan0");
+    strlcpy(logOptions.directory_name, "WiFi", sizeof(logOptions.directory_name));
+    logOptions.pad9 = 0x1000000;
+    logOptions.pad10 = 2;
+    fDriverLogPipe = CCPipe::withOwnerNameCapacity(this,
+        "com.ath10k.AirportQCA", "DriverLogs", &logOptions);
+    if (!fDriverLogPipe || !fDriverLogPipe->CCPipe::startPipe()) {
+        qca_err("DriverLogs pipe setup failed");
+        return false;
+    }
+
+    CCStreamOptions loggerOptions = {};
+    CCStream *logger = CCStream::withPipeAndName(fDriverLogPipe,
+        "AirportQCA", &loggerOptions);
+    fDriverLogger = OSDynamicCast(CCLogStream, logger);
+    if (!fDriverLogger) {
+        OSSafeReleaseNULL(logger);
+        return false;
+    }
+
+    memset(&logOptions, 0, sizeof(logOptions));
+    logOptions.pipe_type = 0;
+    logOptions.log_data_type = 0;
+    logOptions.pipe_size = 0x200000;
+    logOptions.min_log_size_notify = 0xccccc;
+    logOptions.notify_threshold = 1000;
+    strlcpy(logOptions.file_name, "AirportQCA_Datapath",
+            sizeof(logOptions.file_name));
+    strlcpy(logOptions.directory_name, "WiFi", sizeof(logOptions.directory_name));
+    logOptions.pad9 = (uint32_t)(0x202800000 >> 32);
+    logOptions.pad10 = (uint32_t)0x202800000;
+    fDriverDataPathPipe = CCPipe::withOwnerNameCapacity(this,
+        "com.ath10k.AirportQCA", "DatapathEvents", &logOptions);
+    if (!fDriverDataPathPipe || !fDriverDataPathPipe->CCPipe::startPipe()) {
+        qca_err("DatapathEvents pipe setup failed");
+        return false;
+    }
+
+    memset(&logOptions, 0, sizeof(logOptions));
+    logOptions.pipe_type = 0x200000001;
+    logOptions.log_data_type = 2;
+    logOptions.pipe_size = 128;
+    strlcpy(logOptions.file_name, "StateSnapshots", sizeof(logOptions.file_name));
+    strlcpy(logOptions.name, "0", sizeof(logOptions.name));
+    strlcpy(logOptions.directory_name, "WiFi", sizeof(logOptions.directory_name));
+    fDriverSnapshotsPipe = CCPipe::withOwnerNameCapacity(this,
+        "com.ath10k.AirportQCA", "StateSnapshots", &logOptions);
+    if (!fDriverSnapshotsPipe || !fDriverSnapshotsPipe->CCPipe::startPipe()) {
+        qca_err("StateSnapshots pipe setup failed");
+        return false;
+    }
+
+    CCStreamOptions faultOptions = {};
+    faultOptions.stream_type = 1;
+    faultOptions.console_level = 0xFFFFFFFFFFFFFFFF;
+    fDriverFaultStream = CCStream::withPipeAndName(fDriverSnapshotsPipe,
+        "FaultReporter", &faultOptions);
+    CCDataStream *dataStream = OSDynamicCast(CCDataStream, fDriverFaultStream);
+    if (!dataStream) {
+        qca_err("FaultReporter stream creation failed");
+        return false;
+    }
+
+    fDriverCoreFaultReporter = CCFaultReporter::withStreamWorkloop(
+        dataStream, fWorkQueue);
+    if (!fDriverCoreFaultReporter) {
+        qca_err("CCFaultReporter creation failed");
+        return false;
+    }
+
+    fDriverFaultReporter = IO80211FaultReporter::allocWithParams(
+        fDriverCoreFaultReporter);
+    if (!OSDynamicCast(CommonFaultReporter, fDriverFaultReporter)) {
+        qca_err("IO80211FaultReporter creation failed");
+        return false;
+    }
+
+    return fDriverLogPipe && fDriverDataPathPipe && fDriverSnapshotsPipe &&
+           fDriverLogger && fDriverFaultReporter;
+}
+
+void AirportQCA::releaseCCLogs()
+{
+    if (fDriverSnapshotsPipe && fDriverSnapshotsPipe->getWorkLoop()) {
+        fDriverSnapshotsPipe->CCPipe::stopPipe();
+    }
+    if (fDriverDataPathPipe && fDriverDataPathPipe->getWorkLoop()) {
+        fDriverDataPathPipe->CCPipe::stopPipe();
+    }
+    if (fDriverLogPipe && fDriverLogPipe->getWorkLoop()) {
+        fDriverLogPipe->CCPipe::stopPipe();
+    }
+    OSSafeReleaseNULL(fDriverFaultReporter);
+    OSSafeReleaseNULL(fDriverCoreFaultReporter);
+    OSSafeReleaseNULL(fDriverFaultStream);
+    OSSafeReleaseNULL(fDriverLogger);
+    OSSafeReleaseNULL(fDriverLogPipe);
+    OSSafeReleaseNULL(fDriverDataPathPipe);
+    OSSafeReleaseNULL(fDriverSnapshotsPipe);
+}
+#endif
+
+#ifdef IO80211FAMILY_V2
 bool AirportQCA::isCommandProhibited(int) { return false; }
 SInt32 AirportQCA::enableFeature(IO80211FeatureCode code, void *data)
 {
@@ -877,8 +1149,27 @@ IOReturn AirportQCA::setPOWER(IO80211SkywalkInterface *, apple80211_power_data *
 IOReturn AirportQCA::getCOUNTRY_CODE(IO80211SkywalkInterface *, apple80211_country_code_data *d) { if (!d) return kIOReturnBadArgument; memset(d, 0, sizeof(*d)); d->version = APPLE80211_VERSION; return kIOReturnSuccess; }
 IOReturn AirportQCA::setCOUNTRY_CODE(IO80211SkywalkInterface *, apple80211_country_code_data *) { return kIOReturnSuccess; }
 IOReturn AirportQCA::setGET_DEBUG_INFO(IO80211SkywalkInterface *, apple80211_debug_command *) { return kIOReturnUnsupported; }
-CCLogStream *AirportQCA::getLogger() const { return nullptr; }
-CommonFaultReporter *AirportQCA::getFaultReporterFromDriver() { return nullptr; }
+CCLogStream *AirportQCA::getLogger() const { return fDriverLogger; }
+CommonFaultReporter *AirportQCA::getFaultReporterFromDriver() { return fDriverFaultReporter; }
+
+bool AirportQCA::getLogPipes(CCPipe **logPipe, CCPipe **eventPipe,
+                             CCPipe **snapshotsPipe)
+{
+    bool found = false;
+    if (logPipe) {
+        *logPipe = fDriverLogPipe;
+        found = true;
+    }
+    if (eventPipe) {
+        *eventPipe = fDriverDataPathPipe;
+        found = true;
+    }
+    if (snapshotsPipe) {
+        *snapshotsPipe = fDriverSnapshotsPipe;
+        found = true;
+    }
+    return found;
+}
 UInt32 AirportQCA::hardwareOutputQueueDepth() { return 64; }
 SInt32 AirportQCA::performCountryCodeOperation(IO80211CountryCodeOp) { return kIOReturnSuccess; }
 SInt32 AirportQCA::monitorModeSetEnabled(bool, unsigned int) { return kIOReturnUnsupported; }

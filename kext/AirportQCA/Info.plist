@@ -30,16 +30,27 @@
 			<string>WiFiDriver</string>
 			<key>IONetworkRootType</key>
 			<string>airport</string>
-			<key>IOPCIPrimaryMatch</key>
-			<string>0x0042168c</string>
-			<key>IOPCIMatch</key>
-			<string>0x0042168c</string>
-			<key>IOPCITunnelCompatible</key>
-			<true/>
+			<key>IOProbeScore</key>
+			<integer>70000</integer>
+			<key>IOProviderClass</key>
+			<string>QCAPCIProvider</string>
+			<key>IOResourceMatch</key>
+			<string>IOBSD</string>
+		</dict>
+		<key>QCAPCIProvider</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.ath10k.AirportQCA</string>
+			<key>IOClass</key>
+			<string>QCAPCIProvider</string>
 			<key>IOProbeScore</key>
 			<integer>70000</integer>
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
+			<key>IOPCIMatch</key>
+			<string>0x0042168c</string>
+			<key>IOPCITunnelCompatible</key>
+			<true/>
 		</dict>
 	</dict>
 	<key>NSHumanReadableCopyright</key>
