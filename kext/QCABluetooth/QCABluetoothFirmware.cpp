@@ -201,8 +201,36 @@ bool QCABluetoothFirmware::uploadFirmware()
             IOLog("QCABluetoothFirmware: bundled NVM image is invalid\n");
             return false;
         }
-        IOLog("QCABluetoothFirmware: uploading Rome 3.2 NVM (%u bytes)\n", nvmSize);
-        if (fUsbController->sendVendorRequestOut(QCA_DFU_DOWNLOAD, nvm, QCA_NVM_HEADER_SIZE) != kIOReturnSuccess) {
+
+        /* Create mutable copy for NVM patching.
+         * The NVM contains TLV tags; we need to patch EDL_TAG_ID_HCI (tag 17)
+         * to clear erroneous charging-state flags that cause the controller
+         * to report "charging" when the device is not actually charging. */
+        uint8_t *nvmPatched = (uint8_t *)IOMalloc(nvmSize);
+        if (!nvmPatched) {
+            IOLog("QCABluetoothFirmware: failed to allocate NVM patch buffer\n");
+            return false;
+        }
+        memcpy(nvmPatched, nvm, nvmSize);
+
+        /* Parse TLV tags: [4-byte header][tag_id(2) tag_len(2) reserve1(4) reserve2(4) data[]]... */
+        for (uint32_t offset = QCA_NVM_HEADER_SIZE; offset + 8 < nvmSize;) {
+            uint16_t tag_id = *reinterpret_cast<uint16_t *>(nvmPatched + offset);
+            uint16_t tag_len = *reinterpret_cast<uint16_t *>(nvmPatched + offset + 2);
+            if (tag_id == 17 && tag_len >= 3) {  /* EDL_TAG_ID_HCI */
+                /* data[0] bit 7 = enable in-band sleep (keep).
+                 * Clear bit 6 which may be misinterpreted as "charging" by bluetoothd. */
+                nvmPatched[offset + 8] &= ~0x40;
+                IOLog("QCABluetoothFirmware: patched NVM tag 17 (HCI config), cleared charging flag\n");
+                break;
+            }
+            offset += 8 + tag_len;
+            if (tag_len == 0) break;
+        }
+
+        IOLog("QCABluetoothFirmware: uploading Rome 3.2 NVM (%u bytes, patched)\n", nvmSize);
+        if (fUsbController->sendVendorRequestOut(QCA_DFU_DOWNLOAD, nvmPatched, QCA_NVM_HEADER_SIZE) != kIOReturnSuccess) {
+            IOFree(nvmPatched, nvmSize);
             IOLog("QCABluetoothFirmware: failed to send NVM header\n");
             return false;
         }
@@ -210,18 +238,24 @@ bool QCABluetoothFirmware::uploadFirmware()
         for (uint32_t offset = QCA_NVM_HEADER_SIZE; offset < nvmSize;) {
             const uint32_t chunk = (nvmSize - offset > QCA_DFU_PACKET_SIZE)
                 ? QCA_DFU_PACKET_SIZE : nvmSize - offset;
-            IOReturn result = fUsbController->bulkWrite(nvm + offset, chunk, 3000);
+            IOReturn result = fUsbController->bulkWrite(nvmPatched + offset, chunk, 3000);
             if (result != kIOReturnSuccess) {
+                IOFree(nvmPatched, nvmSize);
                 IOLog("QCABluetoothFirmware: NVM transfer failed at %u/%u (0x%08x)\n",
                       offset, nvmSize, result);
                 return false;
             }
             offset += chunk;
         }
+        IOFree(nvmPatched, nvmSize);
     }
 
     uint8_t finalStatus = 0;
-    IODelay(20000);
+    /* Allow controller time to auto-transition from DFU to HCI mode after NVM upload.
+     * For Rome 3.2, the controller should transition autonomously.
+     * WCN6855 2.1+ requires ~100ms; we wait longer to be safe. */
+    IODelay(150000);  /* 150ms */
+
     ret = fUsbController->sendVendorRequestIn(QCA_CHECK_STATUS, &finalStatus, sizeof(finalStatus));
     if (ret != kIOReturnSuccess ||
         (finalStatus & (QCA_PATCH_UPDATED | QCA_SYSCFG_UPDATED)) !=
@@ -230,6 +264,8 @@ bool QCABluetoothFirmware::uploadFirmware()
               finalStatus, ret);
         return false;
     }
+
+    IOLog("QCABluetoothFirmware: firmware verified, controller should auto-transition to HCI mode\n");
 
     return true;
 }
