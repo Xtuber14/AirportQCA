@@ -31,20 +31,24 @@ int QCABMI::exchangeMessage(const void *req, u32 reqLen, void *resp, u32 *respLe
     /* Submit BMI command over CE0 */
     if (ce->send(0, (void*)req, reqLen) != 0) {
         qca_err("Failed to send BMI command via CE0");
+        fPci->setDiagStr("QCABmiFail", "send");
         return -1;
     }
+    fPci->setDiagStr("QCABmiLast", "sent");
 
     /* If waiting for response, poll CE1 with timeout */
     if (resp && respLen && *respLen > 0) {
         int timeoutMs = 1000;
         while (timeoutMs > 0) {
             if (ce->recv(1, resp, respLen) == 0) {
+                fPci->setDiagStr("QCABmiLast", "recv");
                 return 0; /* Response received successfully */
             }
             qca_mdelay(1);
             timeoutMs--;
         }
         qca_err("Timed out waiting for BMI response on CE1");
+        fPci->setDiagStr("QCABmiFail", "recv");
         return -1;
     }
 

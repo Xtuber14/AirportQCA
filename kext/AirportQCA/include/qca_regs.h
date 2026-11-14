@@ -24,10 +24,12 @@
 
 /* PCIe local (host) registers — offsets relative to PCIE_LOCAL_BASE */
 #define SOC_GLOBAL_RESET_ADDRESS            0x00000008
+
+/* SOC core registers — offsets relative to SOC_CORE_BASE */
+#define CORE_CTRL_ADDRESS                   0x00000000
 #define PCIE_INTR_ENABLE_ADDRESS            0x00000008
 #define PCIE_INTR_CAUSE_ADDRESS             0x0000000C
 #define PCIE_INTR_CLR_ADDRESS               0x00000014
-#define CORE_CTRL_ADDRESS                   0x00000020
 
 #define PCIE_INTR_FIRMWARE_MASK             0x00000400
 #define PCIE_INTR_CE_MASK_ALL               0x0007F800
@@ -57,8 +59,16 @@
 #define RTC_STATE_V_MASK                   0x00000007
 #define RTC_STATE_V_ON                     0x00000003
 
-/* Target Firmware Indicator Register (absolute target address) */
+/* Target Firmware Indicator Register (absolute target address).
+   ath10k maps the QCA9377 (device id 0x0042) onto qca6174_regs, whose
+   fw_indicator_address is 0x3a028. */
 #define FW_INDICATOR_ADDRESS                0x0003a028
+
+/* Alternate indicator observed on this chip: it holds the QCA "alive"
+   magic 0xdeadc0de. Only used for diagnostics until the authoritative
+   indicator has been confirmed. */
+#define FW_INDICATOR_ALT_ADDRESS            0x0000180C
+
 #define FW_IND_EVENT_PENDING                0x00000001
 #define FW_IND_INITIALIZED                  0x00000002
 
@@ -80,14 +90,36 @@
 #define CE_CTRL1_OFFSET                     0x00000010
 #define CE_CMD_OFFSET                       0x00000018
 #define CE_HOST_IE_OFFSET                   0x0000002C
+#define CE_WM_STATUS_OFFSET                 0x00000030
 #define CE_MISC_IE_OFFSET                   0x00000034
 #define CE_SRC_WR_INDEX_OFFSET              0x0000003C
 #define CE_DST_WR_INDEX_OFFSET              0x00000040
 #define CE_SRC_RD_INDEX_OFFSET              0x00000044
 #define CE_DST_RD_INDEX_OFFSET              0x00000048
+
+/* Copy Engine control register 1 (offset 0x10 inside a CE block).
+   Bits [15:0] hold dmax (maximum transfer size), bit 16 enables
+   source-ring byte swap and bit 17 destination-ring byte swap. ath10k
+   clears both byte-swap bits; the register's reset value (0x80) has to
+   survive the read-modify-write sequence. */
+#define CE_CTRL1_RESET_VALUE                0x00000080
 #define CE_CTRL1_DMAX_MASK                  0x0000FFFF
-#define CE_CTRL1_SRC_RING_ENABLE            0x00010000
-#define CE_CTRL1_DST_RING_ENABLE            0x00020000
+#define CE_CTRL1_SRC_BYTE_SWAP              0x00010000
+#define CE_CTRL1_DST_BYTE_SWAP              0x00020000
+
+/* Ring watermark registers: lowmark lives in bits [31:16], highmark in
+   bits [15:0]. ath10k programs lowmark = 0 and highmark = the number of
+   ring entries. */
+#define CE_SRC_WM_OFFSET                    0x0000004C
+#define CE_DST_WM_OFFSET                    0x00000050
+#define CE_WM_HIGH_MASK                     0x0000FFFF
+#define CE_WM_LOW_MASK                      0xFFFF0000
+
+/* CE descriptor metadata field (ath10k qca6174_values: mask 0xFFFC at
+   bit 2). BMI transfers use transfer id -1, i.e. all metadata bits set. */
+#define CE_DESC_META_DATA_MASK              0x0000FFFC
+#define CE_DESC_META_DATA_LSB               2
+#define CE_DESC_META_DATA_BMI               0x0000FFFC
 
 /* qca6174 PLL / CPU clock registers (BMI SOC-register addressing:
    address = <base> | <offset>, e.g. RTC_SOC_BASE_ADDRESS | EFUSE_OFFSET) */

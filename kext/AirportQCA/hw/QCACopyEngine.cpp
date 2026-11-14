@@ -73,6 +73,11 @@ bool QCACopyEngine::initPipes()
             pipe.srcRingPhys = pipe.srcRingMem->getPhysicalAddress();
             if (pipe.srcRingPhys > 0xffffffffULL) return false;
             memset(pipe.srcRing, 0, ringSize);
+            /* The CE descriptors must carry the address the device sees
+               on the bus. This is an Intel host without a PCIe IOMMU, so
+               the CPU physical address is the bus address; the value is
+               recorded so a mismatch is visible in the next boot. */
+            fPci->setDiagProp("QCACeSrcPhys", (u32)pipe.srcRingPhys);
         }
 
         /* Allocate Destination Ring if entries > 0 */
@@ -93,6 +98,7 @@ bool QCACopyEngine::initPipes()
             pipe.dstRingPhys = pipe.dstRingMem->getPhysicalAddress();
             if (pipe.dstRingPhys > 0xffffffffULL) return false;
             memset(pipe.dstRing, 0, ringSize);
+            fPci->setDiagProp("QCACeDstPhys", (u32)pipe.dstRingPhys);
 
             size_t buffersSize = (size_t)pipe.destEntries * pipe.maxBufSize;
             pipe.dstBufferMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
@@ -104,6 +110,7 @@ bool QCACopyEngine::initPipes()
             pipe.dstBufferPhys = pipe.dstBufferMem->getPhysicalAddress();
             if (!pipe.dstBuffer || pipe.dstBufferPhys + buffersSize > 0x100000000ULL) return false;
             memset(pipe.dstBuffer, 0, buffersSize);
+            fPci->setDiagProp("QCACeBufPhys", (u32)pipe.dstBufferPhys);
         }
 
 
@@ -115,19 +122,52 @@ bool QCACopyEngine::initPipes()
 
 void QCACopyEngine::startPipes()
 {
+    /* Mirrors ath10k_ce_init_src_ring()/ath10k_ce_init_dest_ring():
+       base address, ring size, dmax, byte swap cleared, lowmark 0 and
+       highmark = number of entries. The byte-swap bits live in CTRL1
+       (bit 16 source, bit 17 destination) and the ring watermarks live
+       in dedicated registers at CE offset 0x4c / 0x50. */
     for (unsigned i = 0; i < CE_COUNT; ++i) {
         CEPipe &pipe = fPipes[i];
         if (!pipe.srcEntries && !pipe.destEntries) continue;
         const u32 base = pipe.baseOffset;
-        fPci->write32(base + CE_SRC_RING_BASE_ADDR_OFFSET, (u32)pipe.srcRingPhys);
-        fPci->write32(base + CE_SRC_RING_SZ_OFFSET, pipe.srcEntries);
-        fPci->write32(base + CE_DST_RING_BASE_ADDR_OFFSET, (u32)pipe.dstRingPhys);
-        fPci->write32(base + CE_DST_RING_SZ_OFFSET, pipe.destEntries);
-        u32 ctrl = pipe.maxBufSize & CE_CTRL1_DMAX_MASK;
-        if (pipe.srcEntries) ctrl |= CE_CTRL1_SRC_RING_ENABLE;
-        if (pipe.destEntries) ctrl |= CE_CTRL1_DST_RING_ENABLE;
-        fPci->write32(base + CE_CTRL1_OFFSET, ctrl);
-        pipe.srcWrIdx = pipe.srcRdIdx = 0;
+
+        if (pipe.srcEntries) {
+            fPci->write32(base + CE_SRC_RING_BASE_ADDR_OFFSET, (u32)pipe.srcRingPhys);
+            fPci->write32(base + CE_SRC_RING_SZ_OFFSET, pipe.srcEntries);
+
+            /* CTRL1 is read-modify-written so that the reset value
+               (0x80) and any hardware-set bits survive; byte swap must
+               be cleared or every descriptor gets mangled. */
+            u32 ctrl = fPci->read32(base + CE_CTRL1_OFFSET);
+            ctrl &= ~(CE_CTRL1_DMAX_MASK | CE_CTRL1_SRC_BYTE_SWAP | CE_CTRL1_DST_BYTE_SWAP);
+            ctrl |= (pipe.maxBufSize & CE_CTRL1_DMAX_MASK);
+            fPci->write32(base + CE_CTRL1_OFFSET, ctrl);
+
+            /* Source ring watermarks: lowmark 0, highmark nentries. */
+            u32 wm = fPci->read32(base + CE_SRC_WM_OFFSET);
+            wm &= ~CE_WM_LOW_MASK;
+            wm = (wm & ~CE_WM_HIGH_MASK) | (pipe.srcEntries & CE_WM_HIGH_MASK);
+            fPci->write32(base + CE_SRC_WM_OFFSET, wm);
+        }
+
+        if (pipe.destEntries) {
+            fPci->write32(base + CE_DST_RING_BASE_ADDR_OFFSET, (u32)pipe.dstRingPhys);
+            fPci->write32(base + CE_DST_RING_SZ_OFFSET, pipe.destEntries);
+
+            u32 ctrl = fPci->read32(base + CE_CTRL1_OFFSET);
+            ctrl &= ~CE_CTRL1_DST_BYTE_SWAP;
+            fPci->write32(base + CE_CTRL1_OFFSET, ctrl);
+
+            /* Destination ring watermarks: lowmark 0, highmark nentries. */
+            u32 wm = fPci->read32(base + CE_DST_WM_OFFSET);
+            wm &= ~CE_WM_LOW_MASK;
+            wm = (wm & ~CE_WM_HIGH_MASK) | (pipe.destEntries & CE_WM_HIGH_MASK);
+            fPci->write32(base + CE_DST_WM_OFFSET, wm);
+        }
+
+        pipe.srcWrIdx = 0;
+        pipe.srcRdIdx = 0;
         pipe.dstRdIdx = 0;
         pipe.dstWrIdx = 0;
         if (pipe.destEntries) {
@@ -138,10 +178,18 @@ void QCACopyEngine::startPipes()
                 pipe.dstRing[n].nbytes = 0;
                 pipe.dstRing[n].flags = 0;
             }
+            OSSynchronizeIO();
             pipe.dstWrIdx = postCount;
             fPci->write32(base + CE_DST_WR_INDEX_OFFSET, pipe.dstWrIdx);
         }
         fPci->write32(base + CE_SRC_WR_INDEX_OFFSET, 0);
+
+        /* Record the programmed state so the next boot can be compared
+           against the ath10k reference values. */
+        fPci->setDiagProp("QCACECtrl1", fPci->read32(base + CE_CTRL1_OFFSET));
+        fPci->setDiagProp("QCACECtrl1Sz", pipe.srcEntries | (pipe.destEntries << 16));
+        fPci->setDiagProp("QCACESrcWm", fPci->read32(base + CE_SRC_WM_OFFSET));
+        fPci->setDiagProp("QCACEDstWm", fPci->read32(base + CE_DST_WM_OFFSET));
     }
 }
 
@@ -149,6 +197,11 @@ void QCACopyEngine::stopPipes()
 {
     for (int i = 0; i < CE_COUNT; i++) {
         CEPipe &pipe = fPipes[i];
+        if (pipe.pendingDma) {
+            pipe.pendingDma->complete();
+            pipe.pendingDma->release();
+            pipe.pendingDma = nullptr;
+        }
         if (pipe.srcRingMem) {
             pipe.srcRingMem->complete();
             pipe.srcRingMem->release();
@@ -174,6 +227,10 @@ int QCACopyEngine::send(u32 pipeId, void *buf, u32 len)
     CEPipe &pipe = fPipes[pipeId];
     if (!pipe.srcEntries || !pipe.srcRing || len > pipe.maxBufSize) return -1;
 
+    /* The previous transfer has completed by now (the BMI response for
+       it has already been received), so its buffer can go away. */
+    releasePending(pipe);
+
     auto *dma = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
         kernel_task, kIODirectionInOut | kIOMemoryHostPhysicallyContiguous,
         len, 0x00000000FFFFFFFFULL);
@@ -186,26 +243,53 @@ int QCACopyEngine::send(u32 pipeId, void *buf, u32 len)
     if (paddr > 0xffffffffULL) { dma->complete(); dma->release(); return -1; }
 
     const u32 base = pipe.baseOffset;
-    const u32 next = (pipe.srcWrIdx + 1) % pipe.srcEntries;
+    const u32 mask = pipe.srcEntries - 1;
+    const u32 next = (pipe.srcWrIdx + 1) & mask;
     int timeout = 1000;
-    while (next == fPci->read32(base + CE_SRC_RD_INDEX_OFFSET) && timeout-- > 0)
+    while (next == (fPci->read32(base + CE_SRC_RD_INDEX_OFFSET) & mask) && timeout-- > 0)
         qca_mdelay(1);
-    if (timeout <= 0) { dma->complete(); dma->release(); return -1; }
+    if (timeout <= 0) {
+        fPci->setDiagProp("QCACeSendFull", pipe.srcWrIdx);
+        dma->complete(); dma->release(); return -1;
+    }
 
     struct ce_desc &desc = pipe.srcRing[pipe.srcWrIdx];
     desc.addr = cpu_to_le32((u32)paddr);
     desc.nbytes = cpu_to_le16((u16)len);
-    desc.flags = 0;
+    /* ath10k fills the descriptor metadata field with the transfer id;
+       BMI uses transfer id -1, i.e. all metadata bits set. */
+    desc.flags = cpu_to_le16((u16)CE_DESC_META_DATA_BMI);
     OSSynchronizeIO();
     pipe.srcWrIdx = next;
     fPci->write32(base + CE_SRC_WR_INDEX_OFFSET, next);
 
+    /* Wait for the Copy Engine to fetch the descriptor. */
     timeout = 1000;
-    while (fPci->read32(base + CE_SRC_RD_INDEX_OFFSET) != next && timeout-- > 0)
+    u32 rdIdx = fPci->read32(base + CE_SRC_RD_INDEX_OFFSET);
+    while ((rdIdx & mask) != next && timeout-- > 0) {
         qca_mdelay(1);
-    dma->complete();
-    dma->release();
-    return timeout > 0 ? 0 : -1;
+        rdIdx = fPci->read32(base + CE_SRC_RD_INDEX_OFFSET);
+    }
+    if (timeout <= 0) {
+        fPci->setDiagProp("QCACeSendStall", rdIdx);
+        fPci->setDiagProp("QCACeSendWr", next);
+        dma->complete(); dma->release(); return -1;
+    }
+
+    /* Keep the buffer alive until the next transfer: the Copy Engine
+       may still be reading it when this call returns. */
+    pipe.pendingDma = dma;
+    fPci->setDiagProp("QCACeSendOk", next);
+    return 0;
+}
+
+void QCACopyEngine::releasePending(CEPipe &pipe)
+{
+    if (pipe.pendingDma) {
+        pipe.pendingDma->complete();
+        pipe.pendingDma->release();
+        pipe.pendingDma = nullptr;
+    }
 }
 
 int QCACopyEngine::recv(u32 pipeId, void *buf, u32 *len)

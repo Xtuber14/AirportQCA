@@ -59,11 +59,19 @@ public:
 
     bool wakeTarget();
     void markTargetAsleep();
+    void dumpRegisterFingerprint(const char *tag);
+    void snapshotRegisters(const char *tag);
+
+    /* Registry breadcrumbs. The driver's IOLog output never reaches the
+       unified log, so every bring-up value is mirrored into ioreg. */
+    void setDiagProp(const char *key, u32 value);
+    void setDiagStr(const char *key, const char *value);
 
     /* Hardware Resets */
     int warmReset();
     int chipReset();
-    int waitForTargetInit();
+    int waitForTargetInit(int timeoutMs = 3000);
+    bool targetInitialized();
 
     /* Target bring-up helpers */
     int enablePllClock();
@@ -107,6 +115,7 @@ private:
     uint8_t          fMacAddr[6];
     bool             fFwRunning;
     bool             fTargetAwake;
+    UInt8            fPcieCap;
 };
 
 #endif /* _QCA_PCI_DEVICE_HPP_ */

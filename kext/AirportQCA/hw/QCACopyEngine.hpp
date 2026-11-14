@@ -56,6 +56,11 @@ private:
         dma_addr_t dstRingPhys;
         dma_addr_t dstBufferPhys;
 
+        /* Buffer of the transfer that is still in flight. ath10k keeps
+           the request buffer mapped until the BMI response has arrived;
+           the buffer is released when the next transfer is posted. */
+        IOBufferMemoryDescriptor *pendingDma;
+
         u32 srcWrIdx;
         u32 srcRdIdx;
         u32 dstWrIdx;
@@ -64,6 +69,8 @@ private:
 
     QCAPCIDevice *fPci;
     CEPipe fPipes[CE_COUNT];
+
+    void releasePending(CEPipe &pipe);
 };
 
 #endif /* _QCA_COPY_ENGINE_HPP_ */
