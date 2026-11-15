@@ -34,13 +34,15 @@ static void qcaSetHexProp(IOPCIDevice *nub, const char *key, u32 value)
 }
 
 /* The authoritative firmware indicator is the one ath10k uses for the
-   QCA9377 (qca6174_regs.fw_indicator_address = 0x3a028). The second
-   candidate is sampled for diagnostics only: it holds the QCA "alive"
-   magic 0xdeadc0de on this chip but never changes, so treating it as
-   the indicator would mask a target that never came up. */
+   QCA9377 (qca6174_regs.fw_indicator_address = 0x3a028). A second
+   candidate used to be sampled at 0x180c; that address is not part of
+   the QCA9377 register map and answers with the poison value 0xdeadc0de.
+   The firmware indicator changed from 0 to "event pending" immediately
+   after the driver had touched that address, so the access is dropped:
+   ath10k never reads it either and an access to an unimplemented MMIO
+   address can upset the target ROM. */
 static const u32 kFwIndicatorCandidates[] = {
     0x0003a028,   /* qca6174 fw_indicator_address (authoritative) */
-    0x0000180c,   /* alternate scratch register (diagnostic only) */
 };
 
 #define FW_IND_CANDIDATE_COUNT \
@@ -52,7 +54,6 @@ static const u32 kRegFingerprint[] = {
     0x00000800,   /* SOC reset control */
     0x00000828,   /* scratch 3 */
     0x000008f0,   /* SoC chip id */
-    0x0000180c,   /* alternate indicator */
     0x00034400,   /* CE0 base */
     0x00034410,   /* CE0 control 1 */
     0x00034418,   /* CE0 command */
@@ -73,10 +74,10 @@ static const u32 kRegSnapshot[] = {
     0x00000800,   /* SOC reset control */
     0x00000828,   /* scratch 3 */
     0x000008f0,   /* SoC chip id */
-    0x0000180c,   /* alternate indicator */
     0x00034410,   /* CE0 control 1 */
     0x00034418,   /* CE0 command */
     0x00034430,   /* CE0 watermark interrupt status */
+    0x00034434,   /* CE0 misc interrupt enable (error bits) */
     0x00034444,   /* CE0 source read index */
     0x00034848,   /* CE1 destination read index */
     0x0003a000,   /* SoC core control */
@@ -88,6 +89,34 @@ static const u32 kRegSnapshot[] = {
 
 #define REG_SNAPSHOT_COUNT \
     (sizeof(kRegSnapshot) / sizeof(kRegSnapshot[0]))
+
+/* Copy Engine error and status registers. The "misc interrupt enable"
+   register carries the CE error bits (axi error, destination address
+   error, source length error, destination length violation and the two
+   overflow flags); they tell whether the host and the target disagreed
+   about the ring layout. */
+static const u32 kCeErrorRegisters[] = {
+    0x00034008,   /* CE wrapper interrupt summary */
+    0x00034418,   /* CE0 command */
+    0x00034434,   /* CE0 misc interrupt enable */
+    0x00034810,   /* CE1 control 1 */
+    0x00034818,   /* CE1 command */
+    0x00034834,   /* CE1 misc interrupt enable */
+    0x00035034,   /* CE3 misc interrupt enable */
+    0x00035434,   /* CE4 misc interrupt enable */
+};
+
+#define CE_ERROR_REGISTER_COUNT \
+    (sizeof(kCeErrorRegisters) / sizeof(kCeErrorRegisters[0]))
+
+/* Maximum number of firmware indicator value changes that are recorded
+   while the driver waits for the target. */
+#define FW_IND_SEQ_MAX                     32
+
+/* Time the driver keeps polling the firmware indicator after the target
+   raised the event-pending bit. The event is not fatal on its own: the
+   BMI exchange is the authoritative liveness probe. */
+#define FW_IND_CRASH_GRACE_MS              200
 
 static bool findFirmwareImages(const u8 *blob, u32 size, const u8 **otp, u32 *otpLen,
                                const u8 **image, u32 *imageLen)
@@ -202,6 +231,7 @@ bool QCAPCIDevice::init(IOPCIDevice *pciNub, AirportQCA *driver)
     applyLinkPowerPolicy();
     dumpPcieState("Pre");
     dumpPcieConfig("Pre");
+    dumpAerState("Pre");
 
     /* Initialize Copy Engine */
     fPciNub->setProperty("QCAStartStage", "hal-ce");
@@ -231,21 +261,31 @@ bool QCAPCIDevice::wakeTarget()
     /* ath10k __ath10k_pci_wake + ath10k_pci_wake_wait: assert the SoC
        wake bit in the PCIe local register block and wait until the RTC
        state register reports ON. While the SoC sleeps its register file
-       is unpowered, so reads return zero and the ROM never runs. */
+       is unpowered, so reads return zero and the ROM never runs.
+
+       ath10k only writes the wake register when the SoC really is
+       asleep, and the QCA6174 is known to misbehave when SOC_WAKE is
+       poked too often (ath10k pci.h). The RTC state register lives in
+       the host side register block, so it can be read without waking
+       the SoC first: check it and only write the wake bit when the SoC
+       is actually off. */
     if (fTargetAwake) return true;
     if (!fMmioBase) return false;
 
-    write32Raw(PCIE_LOCAL_BASE_ADDRESS + PCIE_SOC_WAKE_ADDRESS, PCIE_SOC_WAKE_V_MASK);
-
-    u32 state = 0;
-    for (int i = 0; i < 100; i++) {
-        state = read32Raw(PCIE_LOCAL_BASE_ADDRESS + RTC_STATE_ADDRESS);
-        if ((state & RTC_STATE_V_MASK) == RTC_STATE_V_ON) {
-            fTargetAwake = true;
-            qcaSetHexProp(fPciNub, "QCAWakeState", state);
-            return true;
+    u32 state = read32Raw(PCIE_LOCAL_BASE_ADDRESS + RTC_STATE_ADDRESS);
+    if ((state & RTC_STATE_V_MASK) != RTC_STATE_V_ON) {
+        write32Raw(PCIE_LOCAL_BASE_ADDRESS + PCIE_SOC_WAKE_ADDRESS, PCIE_SOC_WAKE_V_MASK);
+        for (int i = 0; i < 100; i++) {
+            state = read32Raw(PCIE_LOCAL_BASE_ADDRESS + RTC_STATE_ADDRESS);
+            if ((state & RTC_STATE_V_MASK) == RTC_STATE_V_ON) break;
+            qca_mdelay(1);
         }
-        qca_mdelay(1);
+    }
+
+    if ((state & RTC_STATE_V_MASK) == RTC_STATE_V_ON) {
+        fTargetAwake = true;
+        qcaSetHexProp(fPciNub, "QCAWakeState", state);
+        return true;
     }
 
     qcaSetHexProp(fPciNub, "QCAWakeState", state);
@@ -359,6 +399,7 @@ int QCAPCIDevice::chipReset()
     applyLinkPowerPolicy();
     dumpPcieState("Rst");
     dumpPcieConfig("Rst");
+    dumpAerState("Rst");
     return 0;
 }
 
@@ -379,6 +420,20 @@ int QCAPCIDevice::waitForTargetInit(int timeoutMs)
        so the indicator is polled at 1 ms to pin down the exact moment
        the target died. */
     int lastNonZero = -1;
+    /* A crash indication is recorded but not acted upon immediately: the
+       indicator may also be raised by a recoverable event, and the BMI
+       exchange is the authoritative liveness probe. The wait continues
+       for a short grace period so the sequence of indicator values is
+       captured. */
+    bool crashSeen = false;
+    int crashGraceMs = 0;
+    /* History of the indicator: every value change with the millisecond
+       it was seen in. */
+    u32 seqValue[FW_IND_SEQ_MAX];
+    u32 seqMs[FW_IND_SEQ_MAX];
+    unsigned seqCount = 0;
+    u32 prevValue = 0;
+    bool havePrev = false;
 
     while (timeoutMs > 0) {
         /* Keep the SoC awake while polling: re-validate the RTC state
@@ -402,14 +457,34 @@ int QCAPCIDevice::waitForTargetInit(int timeoutMs)
                for diagnostics only. */
             if (i != 0) continue;
             if (val) lastNonZero = elapsed;
+
+            /* Record every change of the indicator together with the
+               time it was seen. */
+            if (!havePrev || val != prevValue) {
+                if (seqCount < FW_IND_SEQ_MAX) {
+                    seqValue[seqCount] = val;
+                    seqMs[seqCount] = (u32)elapsed;
+                    seqCount++;
+                }
+                prevValue = val;
+                havePrev = true;
+            }
+
             if (val & FW_IND_EVENT_PENDING) {
-                qcaSetHexProp(fPciNub, "QCAFwIndLast", val);
-                qcaSetHexProp(fPciNub, "QCAFwIndPolls", totalCount);
-                qcaSetHexProp(fPciNub, "QCAFwIndFirst0", first[0]);
-                qca_err("Target reported firmware crash during init (0x%08x) after %d ms",
-                        val, elapsed);
-                captureCrashState(elapsed);
-                return -1;
+                if (!crashSeen) {
+                    crashSeen = true;
+                    crashGraceMs = FW_IND_CRASH_GRACE_MS;
+                    qcaSetHexProp(fPciNub, "QCAFwIndLast", val);
+                    qcaSetHexProp(fPciNub, "QCAFwIndPolls", totalCount);
+                    qcaSetHexProp(fPciNub, "QCAFwIndFirst0", first[0]);
+                    qca_err("Target reported a firmware event (0x%08x) after %d ms",
+                            val, elapsed);
+                    captureCrashState(elapsed);
+                }
+                /* Keep polling: the target may still reach the
+                   initialized state, and the BMI exchange decides
+                   whether the target is really dead. */
+                continue;
             }
             if (val & FW_IND_INITIALIZED) {
                 char key[32];
@@ -417,6 +492,7 @@ int QCAPCIDevice::waitForTargetInit(int timeoutMs)
                 qcaSetHexProp(fPciNub, key, kFwIndicatorCandidates[i]);
                 qca_info("Target initialized successfully (indicator %u = 0x%08x)",
                          i, val);
+                recordIndicatorSequence(seqValue, seqMs, seqCount);
                 return 0;
             }
         }
@@ -432,6 +508,10 @@ int QCAPCIDevice::waitForTargetInit(int timeoutMs)
         }
         qca_mdelay(1);
         timeoutMs -= 1;
+        if (crashSeen) {
+            crashGraceMs -= 1;
+            if (crashGraceMs <= 0) break;
+        }
     }
 
     for (unsigned i = 0; i < FW_IND_CANDIDATE_COUNT; i++) {
@@ -444,8 +524,29 @@ int QCAPCIDevice::waitForTargetInit(int timeoutMs)
     qcaSetHexProp(fPciNub, "QCAFwIndOnes", onesCount);
     qcaSetHexProp(fPciNub, "QCAFwIndPolls", totalCount);
     qcaSetHexProp(fPciNub, "QCAFwIndLastNz", (u32)lastNonZero);
+    qcaSetHexProp(fPciNub, "QCAFwIndCrash", (u32)(crashSeen ? 1 : 0));
+    recordIndicatorSequence(seqValue, seqMs, seqCount);
+    if (crashSeen) {
+        qca_err("Target did not initialize after the firmware event");
+        return -1;
+    }
     qca_err("Timed out waiting for target initialization");
     return -1;
+}
+
+/* Store the recorded indicator sequence in the registry so the next boot
+   shows exactly how the firmware indication evolved after the reset. */
+void QCAPCIDevice::recordIndicatorSequence(const u32 *values, const u32 *times,
+                                            unsigned count)
+{
+    char key[40];
+    for (unsigned i = 0; i < count; i++) {
+        snprintf(key, sizeof(key), "QCAFwIndSeq%u", i);
+        qcaSetHexProp(fPciNub, key, values[i]);
+        snprintf(key, sizeof(key), "QCAFwIndSeqMs%u", i);
+        qcaSetHexProp(fPciNub, key, times[i]);
+    }
+    qcaSetHexProp(fPciNub, "QCAFwIndSeqLen", (u32)count);
 }
 
 bool QCAPCIDevice::targetInitialized()
@@ -535,6 +636,73 @@ void QCAPCIDevice::applyLinkPowerPolicy()
     }
 }
 
+/* Locate the PCIe Advanced Error Reporting capability. It lives in the
+   extended capability space and reports every PCIe error the endpoint
+   saw; its header log holds the address of the offending transaction,
+   which is the quickest way to find out what killed the target ROM. */
+UInt32 QCAPCIDevice::findAerCapability()
+{
+    IOByteCount offset = 0;
+    UInt32 guard = 0;
+
+    while (guard++ < 32) {
+        UInt32 dw = fPciNub->extendedConfigRead32(offset);
+        UInt16 id = (UInt16)(dw & 0xffff);
+        UInt16 next = (UInt16)((dw >> PCI_EXT_CAP_NEXT_SHIFT) & PCI_EXT_CAP_NEXT_MASK);
+        if (id == 0x0001) return offset;  // kIOPCIExpressCapabilityIDErrorReporting
+        if (!next) break;
+        offset = (offset + next + 3) & ~3u;
+    }
+    return 0;
+}
+
+/* Dump the AER capability: error status, mask and severity registers
+   plus the header log that identifies the failing transaction. */
+void QCAPCIDevice::dumpAerState(const char *tag)
+{
+    char key[40];
+    IOByteCount aer = (IOByteCount)findAerCapability();
+
+    qcaSetHexProp(fPciNub, "QCAAerCap", (u32)aer);
+    if (!aer) return;
+
+    qcaSetHexProp(fPciNub, "QCAAerUncorStatus",
+                   fPciNub->extendedConfigRead32(aer + PCI_EXT_AER_UNCOR_STATUS));
+    qcaSetHexProp(fPciNub, "QCAAerUncorMask",
+                   fPciNub->extendedConfigRead32(aer + PCI_EXT_AER_UNCOR_MASK));
+    qcaSetHexProp(fPciNub, "QCAAerUncorSeverity",
+                   fPciNub->extendedConfigRead32(aer + PCI_EXT_AER_UNCOR_SEVERITY));
+    qcaSetHexProp(fPciNub, "QCAAerCorStatus",
+                   fPciNub->extendedConfigRead32(aer + PCI_EXT_AER_COR_STATUS));
+    qcaSetHexProp(fPciNub, "QCAAerCorMask",
+                   fPciNub->extendedConfigRead32(aer + PCI_EXT_AER_COR_MASK));
+    qcaSetHexProp(fPciNub, "QCAAerCorSeverity",
+                   fPciNub->extendedConfigRead32(aer + PCI_EXT_AER_COR_SEVERITY));
+
+    /* Header log: the first dword holds the faulting address, the
+       second the requester id and the last two the requester data. */
+    for (unsigned i = 0; i < 4; i++) {
+        snprintf(key, sizeof(key), "QCAAerLog%u", i);
+        qcaSetHexProp(fPciNub, key,
+                       fPciNub->extendedConfigRead32(aer + PCI_EXT_AER_HEADER_LOG + i * 4));
+    }
+
+    /* The extended capability list itself, so a capability that macOS
+       added (or that the device exposes) is visible as well. */
+    for (unsigned row = 0; row < 12; row++) {
+        IOByteCount addr = PCI_EXT_CAP_START + row * 16;
+        if (addr >= PCI_EXT_CAP_END) break;
+        UInt32 d0 = fPciNub->extendedConfigRead32(addr);
+        UInt32 d1 = fPciNub->extendedConfigRead32(addr + 4);
+        UInt32 d2 = fPciNub->extendedConfigRead32(addr + 8);
+        UInt32 d3 = fPciNub->extendedConfigRead32(addr + 12);
+        char buf[48];
+        snprintf(buf, sizeof(buf), "%08x %08x %08x %08x", d0, d1, d2, d3);
+        snprintf(key, sizeof(key), "QCAext%s%02x", tag, row * 16);
+        fPciNub->setProperty(key, buf);
+    }
+}
+
 /* PCIe capability state: link and device control/status registers. A
    link that drops into a low-power substate (or that reports a speed
    or width downgrade) explains a target that starts and then dies. */
@@ -586,6 +754,7 @@ void QCAPCIDevice::dumpPcieConfig(const char *tag)
    the configuration space. */
 void QCAPCIDevice::captureCrashState(int elapsedMs)
 {
+    char key[40];
     qcaSetHexProp(fPciNub, "QCACrashMs", (u32)elapsedMs);
     qcaSetHexProp(fPciNub, "QCACrashInd", read32(FW_INDICATOR_ADDRESS));
     qcaSetHexProp(fPciNub, "QCACrashCtrl", read32(SOC_CORE_BASE_ADDRESS + CORE_CTRL_ADDRESS));
@@ -593,9 +762,225 @@ void QCAPCIDevice::captureCrashState(int elapsedMs)
     qcaSetHexProp(fPciNub, "QCACrashIntrCause", read32(SOC_CORE_BASE_ADDRESS + PCIE_INTR_CAUSE_ADDRESS));
     qcaSetHexProp(fPciNub, "QCACrashScratch", read32(RTC_SOC_BASE_ADDRESS + SCRATCH_3_ADDRESS));
     qcaSetHexProp(fPciNub, "QCACrashResetCtl", read32(RTC_SOC_BASE_ADDRESS + SOC_RESET_CONTROL_ADDRESS));
+
+    /* Copy Engine error and status registers: they show whether the
+       host and the target disagreed about the ring layout. */
+    for (unsigned i = 0; i < CE_ERROR_REGISTER_COUNT; i++) {
+        snprintf(key, sizeof(key), "QCACrashCE%05x", kCeErrorRegisters[i]);
+        qcaSetHexProp(fPciNub, key, read32(kCeErrorRegisters[i]));
+    }
+
     snapshotRegisters("Crash");
     dumpPcieState("Crash");
     dumpPcieConfig("Crash");
+    dumpAerState("Crash");
+}
+
+/* Convert a target CPU address into the address space the Copy Engine
+   uses (ath10k_pci_qca6174_targ_cpu_to_ce_addr). The base of the
+   interconnect window comes from the SoC core control register; bit 20
+   of the result selects the target space above 1 MB. */
+u32 QCAPCIDevice::targCpuToCeAddr(u32 addr)
+{
+    u32 val = read32(SOC_CORE_BASE_ADDRESS + CORE_CTRL_ADDRESS) & 0x7ff;
+    val <<= 21;
+    val |= ((addr >= 0x100000) ? 0x100000 : 0) | (addr & 0xfffff);
+    return val;
+}
+
+/* Target firmware's Copy Engine configuration (ath10k
+   pci_target_ce_config_wlan). Only the first
+   NUM_TARGET_CE_CONFIG_WLAN entries are pushed to the target for the
+   QCA6174 family. CE5 is overridden for QCA6174/QCA9377 exactly like
+   ath10k_pci_override_ce_config does. */
+static const struct qca_ce_pipe_config kTargetCeConfig[] = {
+    /* CE0: host->target HTC control and raw streams */
+    { 0, PIPEDIR_OUT,  32,  256, 0, 0 },
+    /* CE1: target->host HTT + HTC control */
+    { 1, PIPEDIR_IN,   32, 2048, 0, 0 },
+    /* CE2: target->host WMI */
+    { 2, PIPEDIR_IN,   64, 2048, 0, 0 },
+    /* CE3: host->target WMI */
+    { 3, PIPEDIR_OUT,  32, 2048, 0, 0 },
+    /* CE4: host->target HTT */
+    { 4, PIPEDIR_OUT, 256,  256, 0, 0 },
+    /* CE5: target->host HTT (HIF->HTT), overridden for QCA6174 */
+    { 5, PIPEDIR_OUT,  32, 2048, 0, 0 },
+    /* CE6: target autonomous hif_memcpy */
+    { 6, PIPEDIR_INOUT, 32, 4096, 0, 0 },
+};
+
+/* Map from service/endpoint to Copy Engine. The table is derived from
+   the target CE configuration above and is passed to the target at
+   startup (ath10k pci_target_service_to_ce_map_wlan). The HTT data
+   input is remapped to CE1 for QCA6174/QCA9377. */
+static const struct qca_ce_service_to_pipe kServiceToPipeMap[] = {
+    { ATH10K_HTC_SVC_ID_WMI_DATA_VO, PIPEDIR_OUT, 3 },
+    { ATH10K_HTC_SVC_ID_WMI_DATA_VO, PIPEDIR_IN,  2 },
+    { ATH10K_HTC_SVC_ID_WMI_DATA_BK, PIPEDIR_OUT, 3 },
+    { ATH10K_HTC_SVC_ID_WMI_DATA_BK, PIPEDIR_IN,  2 },
+    { ATH10K_HTC_SVC_ID_WMI_DATA_BE, PIPEDIR_OUT, 3 },
+    { ATH10K_HTC_SVC_ID_WMI_DATA_BE, PIPEDIR_IN,  2 },
+    { ATH10K_HTC_SVC_ID_WMI_DATA_VI, PIPEDIR_OUT, 3 },
+    { ATH10K_HTC_SVC_ID_WMI_DATA_VI, PIPEDIR_IN,  2 },
+    { ATH10K_HTC_SVC_ID_WMI_CONTROL, PIPEDIR_OUT, 3 },
+    { ATH10K_HTC_SVC_ID_WMI_CONTROL, PIPEDIR_IN,  2 },
+    { ATH10K_HTC_SVC_ID_RSVD_CTRL, PIPEDIR_OUT, 0 },
+    { ATH10K_HTC_SVC_ID_RSVD_CTRL, PIPEDIR_IN,  1 },
+    { ATH10K_HTC_SVC_ID_TEST_RAW_STREAMS, PIPEDIR_OUT, 0 },
+    { ATH10K_HTC_SVC_ID_TEST_RAW_STREAMS, PIPEDIR_IN,  1 },
+    { ATH10K_HTC_SVC_ID_HTT_DATA_MSG, PIPEDIR_OUT, 4 },
+    { ATH10K_HTC_SVC_ID_HTT_DATA_MSG, PIPEDIR_IN,  1 },
+    { 0, 0, 0 },
+};
+
+/* Map an HTC service id to the Copy Engine pipes used for the uplink
+   (host -> target) and the downlink (target -> host) direction. The
+   lookup uses the very same table that is downloaded to the target in
+   initConfig(), so the host and the target always agree on the pipes
+   (ath10k_pci_hif_map_service_to_pipe). */
+bool QCAPCIDevice::mapServiceToPipe(u16 serviceId, u8 *ulPipe, u8 *dlPipe) const
+{
+    bool ulSet = false, dlSet = false;
+
+    for (unsigned i = 0; i < sizeof(kServiceToPipeMap) / sizeof(kServiceToPipeMap[0]); i++) {
+        const struct qca_ce_service_to_pipe &entry = kServiceToPipeMap[i];
+        if (entry.service_id != serviceId) continue;
+
+        switch (entry.pipedir) {
+        case PIPEDIR_NONE:
+            break;
+        case PIPEDIR_IN:
+            *dlPipe = (u8)entry.pipenum;
+            dlSet = true;
+            break;
+        case PIPEDIR_OUT:
+            *ulPipe = (u8)entry.pipenum;
+            ulSet = true;
+            break;
+        case PIPEDIR_INOUT:
+            *dlPipe = (u8)entry.pipenum;
+            *ulPipe = (u8)entry.pipenum;
+            dlSet = true;
+            ulSet = true;
+            break;
+        }
+    }
+
+    return ulSet && dlSet;
+}
+
+/* Download the target-side Copy Engine configuration and the
+   service-to-CE map to the target and tell the target that the early
+   configuration is complete (ath10k_pci_init_config). Without this the
+   target has no valid pipe configuration and refuses to talk to the
+   host. */
+int QCAPCIDevice::initConfig()
+{
+    u32 interconnectAddr = QCA_HOST_INTEREST + HI_INTERCONNECT_STATE_OFFSET;
+    u32 pcieStateAddr = 0;
+    u32 pipeCfgAddr = 0;
+    u32 svcToPipeMap = 0;
+    u32 configFlags = 0;
+    u32 eallocAddr, eallocValue = 0;
+    u32 flag2Addr, flag2Value = 0;
+
+    /* The target stores the addresses of its pipe configuration and of
+       the service-to-pipe map in the interconnect state structure; the
+       host interest area points at that structure. */
+    if (fCopyEngine->diagReadMem(interconnectAddr, &pcieStateAddr, sizeof(pcieStateAddr)) != 0) {
+        qca_err("Failed to read the interconnect state address");
+        return -1;
+    }
+    qcaSetHexProp(fPciNub, "QCAInterconnectAddr", pcieStateAddr);
+    if (!pcieStateAddr) {
+        qca_err("Invalid interconnect state address");
+        return -1;
+    }
+
+    if (fCopyEngine->diagReadMem(pcieStateAddr + PCIE_STATE_PIPE_CFG_ADDR_OFFSET,
+                                 &pipeCfgAddr, sizeof(pipeCfgAddr)) != 0) {
+        qca_err("Failed to read the pipe configuration address");
+        return -1;
+    }
+    qcaSetHexProp(fPciNub, "QCAPipeCfgAddr", pipeCfgAddr);
+    if (!pipeCfgAddr) {
+        qca_err("Invalid pipe configuration address");
+        return -1;
+    }
+
+    /* Supply the target-side Copy Engine configuration. */
+    if (fCopyEngine->diagWriteMem(pipeCfgAddr, kTargetCeConfig,
+                                  sizeof(struct qca_ce_pipe_config) * NUM_TARGET_CE_CONFIG_WLAN) != 0) {
+        qca_err("Failed to write the pipe configuration");
+        return -1;
+    }
+
+    if (fCopyEngine->diagReadMem(pcieStateAddr + PCIE_STATE_SVC_TO_PIPE_MAP_OFFSET,
+                                 &svcToPipeMap, sizeof(svcToPipeMap)) != 0) {
+        qca_err("Failed to read the service-to-pipe map address");
+        return -1;
+    }
+    qcaSetHexProp(fPciNub, "QCASvcToPipeAddr", svcToPipeMap);
+    if (!svcToPipeMap) {
+        qca_err("Invalid service-to-pipe map address");
+        return -1;
+    }
+
+    /* Supply the service-to-CE map. */
+    if (fCopyEngine->diagWriteMem(svcToPipeMap, kServiceToPipeMap,
+                                  sizeof(kServiceToPipeMap)) != 0) {
+        qca_err("Failed to write the service-to-pipe map");
+        return -1;
+    }
+
+    /* The target must not enter L1 while the host is driving the
+       interconnect. */
+    if (fCopyEngine->diagReadMem(pcieStateAddr + PCIE_STATE_CONFIG_FLAGS_OFFSET,
+                                 &configFlags, sizeof(configFlags)) != 0) {
+        qca_err("Failed to read the PCIe configuration flags");
+        return -1;
+    }
+    configFlags &= ~PCIE_CONFIG_FLAG_ENABLE_L1;
+    if (fCopyEngine->diagWriteMem(pcieStateAddr + PCIE_STATE_CONFIG_FLAGS_OFFSET,
+                                  &configFlags, sizeof(configFlags)) != 0) {
+        qca_err("Failed to write the PCIe configuration flags");
+        return -1;
+    }
+
+    /* Configure the early allocation: the magic number tells the target
+       that the host supports the early allocation and the bank count
+       tells it how many IRAM banks it may use. */
+    eallocAddr = QCA_HOST_INTEREST + HI_EARLY_ALLOC_OFFSET;
+    if (fCopyEngine->diagReadMem(eallocAddr, &eallocValue, sizeof(eallocValue)) != 0) {
+        qca_err("Failed to read the early allocation value");
+        return -1;
+    }
+    eallocValue |= ((HI_EARLY_ALLOC_MAGIC << HI_EARLY_ALLOC_MAGIC_SHIFT) &
+                    HI_EARLY_ALLOC_MAGIC_MASK);
+    eallocValue |= ((QCA9377_IRAM_BANKS << HI_EARLY_ALLOC_IRAM_BANKS_SHIFT) &
+                    HI_EARLY_ALLOC_IRAM_BANKS_MASK);
+    if (fCopyEngine->diagWriteMem(eallocAddr, &eallocValue, sizeof(eallocValue)) != 0) {
+        qca_err("Failed to write the early allocation value");
+        return -1;
+    }
+    qcaSetHexProp(fPciNub, "QCAEarlyAlloc", eallocValue);
+
+    /* Tell the target to proceed with the initialization. */
+    flag2Addr = QCA_HOST_INTEREST + HI_OPTION_FLAG2_OFFSET;
+    if (fCopyEngine->diagReadMem(flag2Addr, &flag2Value, sizeof(flag2Value)) != 0) {
+        qca_err("Failed to read the option flag 2 value");
+        return -1;
+    }
+    flag2Value |= HI_OPTION_EARLY_CFG_DONE;
+    if (fCopyEngine->diagWriteMem(flag2Addr, &flag2Value, sizeof(flag2Value)) != 0) {
+        qca_err("Failed to write the option flag 2 value");
+        return -1;
+    }
+    qcaSetHexProp(fPciNub, "QCAOptionFlag2", flag2Value);
+
+    qca_info("Early configuration downloaded to the target");
+    return 0;
 }
 
 int QCAPCIDevice::enablePllClock()
@@ -775,13 +1160,26 @@ bool QCAPCIDevice::bootFirmware()
 
     fPciNub->setProperty("QCAStartStage", "fw-target-info");
 
-    /* 4. Enable the target CPU's PCIe interrupt line before BMI
+    /* 4. Download the target-side Copy Engine configuration and the
+       service-to-CE map, then release the target from its early
+       configuration wait (ath10k_pci_init_config). This step uses the
+       Copy Engine 7 diagnostic window, so it only works once the ROM
+       is alive. */
+    setDiagStr("QCAStartStage", "fw-init-config");
+    if (initConfig() != 0) {
+        qca_warn("Early configuration download failed; continuing");
+        setDiagStr("QCAInitConfig", "failed");
+    } else {
+        setDiagStr("QCAInitConfig", "ok");
+    }
+
+    /* 5. Enable the target CPU's PCIe interrupt line before BMI
        traffic (ath10k_pci_wake_target_cpu). */
     u32 ctrl = read32(SOC_CORE_BASE_ADDRESS + CORE_CTRL_ADDRESS);
     write32(SOC_CORE_BASE_ADDRESS + CORE_CTRL_ADDRESS,
             ctrl | CORE_CTRL_CPU_INTR_MASK);
 
-    /* 5. Query ROM target info. This doubles as the authoritative
+    /* 6. Query ROM target info. This doubles as the authoritative
        liveness probe: a live ROM answers even if the firmware
        indicator was never written. */
     setDiagStr("QCAStartStage", "fw-bmi-send");
@@ -795,14 +1193,14 @@ bool QCAPCIDevice::bootFirmware()
     qca_info("Target Xtensa CPU active: version 0x%08x type 0x%08x", info.version, info.type);
     setDiagStr("QCAStartStage", "fw-bmi-ok");
 
-    /* 6. Enable the PLL clock before bulk transfers
+    /* 7. Enable the PLL clock before bulk transfers
        (ath10k_hw_qca6174_enable_pll_clock; failure is non-fatal). */
     setDiagStr("QCAStartStage", "fw-pll");
     if (enablePllClock() != 0) {
         qca_info("PLL clock config failed; continuing at ROM clock");
     }
 
-    /* 7. Configure the target's shared host-interest settings before
+    /* 8. Configure the target's shared host-interest settings before
        board and firmware download (ath10k_init_configure_target). */
     setDiagStr("QCAStartStage", "fw-config");
     if (configureTarget() != 0) {

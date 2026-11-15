@@ -46,6 +46,7 @@ QCAHTC::QCAHTC(QCAPCIDevice *pci) : fPci(pci), fCreditSize(0)
     memset(fPipeOut, 0, sizeof(fPipeOut));
     memset(fPipeIn, 0, sizeof(fPipeIn));
     memset(fSequence, 0, sizeof(fSequence));
+    memset(fPendingCount, 0, sizeof(fPendingCount));
 }
 
 QCAHTC::~QCAHTC() {}
@@ -126,10 +127,22 @@ bool QCAHTC::connectService(u8 requestedEndpoint, u16 serviceId)
     fConnected[requestedEndpoint] = true;
     fService[requestedEndpoint] = serviceId;
     fMaxMessage[requestedEndpoint] = le16_to_cpu(rb->maxMessageSize);
-    fPipeOut[requestedEndpoint] = serviceId == ATH10K_SERVICE_WMI_CONTROL ? 3 : 4;
-    fPipeIn[requestedEndpoint] = serviceId == ATH10K_SERVICE_WMI_CONTROL ? 2 : 5;
+
+    /* The Copy Engine pipes of a service are not a host-side constant:
+       they come from the same service-to-pipe table that the host
+       downloads to the target in the early configuration, so the two
+       sides always agree (ath10k_hif_map_service_to_pipe). */
+    u8 ulPipe = 0, dlPipe = 0;
+    if (!fPci->mapServiceToPipe(serviceId, &ulPipe, &dlPipe)) {
+        qca_err("Unsupported HTC service 0x%04x", serviceId);
+        fConnected[requestedEndpoint] = false;
+        return false;
+    }
+    fPipeOut[requestedEndpoint] = ulPipe;
+    fPipeIn[requestedEndpoint] = dlPipe;
     fCredits[requestedEndpoint] = 32;
-    qca_info("HTC service 0x%04x connected at endpoint %u", serviceId, requestedEndpoint);
+    qca_info("HTC service 0x%04x connected at endpoint %u (ul ce%u dl ce%u)",
+             serviceId, requestedEndpoint, ulPipe, dlPipe);
     return true;
 }
 
@@ -165,17 +178,73 @@ int QCAHTC::send(u8 epId, void *buf, u32 len)
     return ce ? ce->send(fPipeOut[epId], frame, len + sizeof(*header)) : -1;
 }
 
+/* Queue a frame that arrived on an endpoint's Copy Engine but carries
+   the endpoint id of a different endpoint. */
+bool QCAHTC::queuePending(u8 eid, const u8 *frame, u32 frameLength)
+{
+    if (eid >= ATH10K_HTC_EP_COUNT) return false;
+    if (fPendingCount[eid] >= HTC_PENDING_SLOTS) return false;
+
+    const struct ath10k_htc_hdr *header = (const struct ath10k_htc_hdr *)frame;
+    if (frameLength < sizeof(*header)) return false;
+    u32 payloadLength = le16_to_cpu(header->len);
+    if (payloadLength > frameLength - sizeof(*header)) return false;
+    if (payloadLength > HTC_FRAME_MAX - sizeof(*header)) return false;
+
+    PendingFrame &slot = fPending[eid][fPendingCount[eid]];
+    memcpy(slot.data, frame + sizeof(*header), payloadLength);
+    slot.len = (u16)payloadLength;
+    fPendingCount[eid]++;
+    return true;
+}
+
+/* Hand a queued frame to its endpoint. */
+bool QCAHTC::takePending(u8 eid, void *buf, u32 *len)
+{
+    if (eid >= ATH10K_HTC_EP_COUNT || fPendingCount[eid] == 0) return false;
+
+    PendingFrame &slot = fPending[eid][0];
+    if (slot.len > *len) return false;
+
+    memcpy(buf, slot.data, slot.len);
+    *len = slot.len;
+
+    for (u8 i = 1; i < fPendingCount[eid]; i++)
+        fPending[eid][i - 1] = fPending[eid][i];
+    fPendingCount[eid]--;
+    return true;
+}
+
 int QCAHTC::recv(u8 epId, void *buf, u32 *len)
 {
     if (epId >= ATH10K_HTC_EP_COUNT || !fConnected[epId] || !buf || !len) return -1;
-    u8 frame[4096];
-    u32 frameLength = sizeof(frame);
+
+    /* A frame that was already received for this endpoint. */
+    if (takePending(epId, buf, len)) return 0;
+
+    u8 frame[HTC_FRAME_MAX];
     QCACopyEngine *ce = fPci->getCopyEngine();
-    if (!ce || ce->recv(fPipeIn[epId], frame, &frameLength) != 0 || frameLength < sizeof(struct ath10k_htc_hdr)) return -1;
-    struct ath10k_htc_hdr *header = (struct ath10k_htc_hdr *)frame;
-    u32 payloadLength = le16_to_cpu(header->len);
-    if (header->eid != epId || payloadLength > frameLength - sizeof(*header) || payloadLength > *len) return -1;
-    memcpy(buf, frame + sizeof(*header), payloadLength);
-    *len = payloadLength;
-    return 0;
+    if (!ce) return -1;
+
+    /* Several endpoints can share one Copy Engine (on the QCA6174
+       family the HTT data and the HTC control endpoint share CE1), so
+       a frame for another endpoint is queued for its owner instead of
+       being dropped. */
+    for (int attempt = 0; attempt <= HTC_PENDING_SLOTS; ++attempt) {
+        u32 frameLength = sizeof(frame);
+        if (ce->recv(fPipeIn[epId], frame, &frameLength) != 0) return -1;
+        if (frameLength < sizeof(struct ath10k_htc_hdr)) return -1;
+
+        struct ath10k_htc_hdr *header = (struct ath10k_htc_hdr *)frame;
+        if (header->eid == epId) {
+            u32 payloadLength = le16_to_cpu(header->len);
+            if (payloadLength > frameLength - sizeof(*header) || payloadLength > *len) return -1;
+            memcpy(buf, frame + sizeof(*header), payloadLength);
+            *len = payloadLength;
+            return 0;
+        }
+
+        if (!queuePending(header->eid, frame, frameLength)) return -1;
+    }
+    return -1;
 }

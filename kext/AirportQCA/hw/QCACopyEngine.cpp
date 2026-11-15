@@ -25,7 +25,7 @@ static const CEPipeConfig qca9377_ce_configs[CE_COUNT] = {
     { 2, 0, 128, 2048 },     /* WMI events */
     { 3, 32, 0, 2048 },     /* WMI commands */
     { 4, 8192, 0, 256 },    /* HTT messages */
-    { 5, 0, 512, 512 },     /* HTT receive */
+    { 5, 0, 0, 0 },          /* QCA6174: CE5 is used by the target itself */
     { 6, 0, 0, 0 },
     { 7, 2, 2, 2048 }       /* diagnostic window */
 };

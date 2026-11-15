@@ -76,6 +76,29 @@
 #define FW_IND_EVENT_PENDING                0x00000001
 #define FW_IND_INITIALIZED                  0x00000002
 
+/* PCIe extended capability space. The Advanced Error Reporting (AER)
+   capability describes every PCIe error the endpoint saw; its header log
+   even holds the address of the offending transaction, which is the
+   quickest way to find out what killed the target ROM. */
+#define PCI_EXT_CAP_START                  0x00000100
+#define PCI_EXT_CAP_END                    0x00000400
+#define PCI_EXT_CAP_ID_AER                 0x0001
+#define PCI_EXT_CAP_ID_L1PM_SUBSTATES      0x001e
+#define PCI_EXT_CAP_NEXT_SHIFT             20
+#define PCI_EXT_CAP_NEXT_MASK              0x00000FFF
+
+/* AER capability register offsets (PCIe base specification 2.0). */
+#define PCI_EXT_AER_UNCOR_STATUS           0x00000004
+#define PCI_EXT_AER_UNCOR_MASK             0x00000008
+#define PCI_EXT_AER_UNCOR_SEVERITY         0x0000000C
+#define PCI_EXT_AER_COR_STATUS             0x00000010
+#define PCI_EXT_AER_COR_MASK               0x00000014
+#define PCI_EXT_AER_COR_SEVERITY           0x00000018
+#define PCI_EXT_AER_STATUS_UPPER           0x0000001C
+#define PCI_EXT_AER_ROOT_ERROR_COMMAND     0x0000002C
+#define PCI_EXT_AER_ROOT_ERROR_STATUS      0x00000030
+#define PCI_EXT_AER_HEADER_LOG             0x00000038
+
 /* Copy Engine Base Offsets (QCA6174 / QCA9377, stride 0x400) */
 #define CE0_BASE_ADDRESS                    0x00034400
 #define CE1_BASE_ADDRESS                    0x00034800
