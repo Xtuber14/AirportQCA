@@ -13,7 +13,7 @@ This project delivers two kernel extensions that work together to bring **native
 | Kext | Function | Bus | Device IDs |
 |------|----------|-----|------------|
 | **AirportQCA.kext** | Full 802.11ac Wi-Fi driver implementing `IO80211Controller` / `IO80211ControllerV2` | PCIe x1 | `0x168C:0x0042` |
-| **QCABluetoothFirmware.kext** | USB firmware injector for QCA Rome Bluetooth controller | USB 2.0 | `0x0CF3:0xE300` + OEM variants |
+| **QCABluetoothFirmware.kext** | USB firmware injector for QCA Rome Bluetooth controller | USB 2.0 | `0x0CF3:0xE300` + 100+ OEM variants |
 
 **Result:** Zero third-party utilities required. Wi-Fi appears in the native menu bar, System Settings, AirDrop, and Continuity all work. Bluetooth hands off to Apple's native `IOBluetoothFamily` after firmware upload.
 
@@ -23,7 +23,7 @@ This project delivers two kernel extensions that work together to bring **native
 
 ### Wi-Fi (AirportQCA)
 - **Native AirPort emulation** — Subclasses `IO80211Controller` / `IO80211ControllerV2` for full macOS integration
-- **Skywalk / IO80211InfraProtocol support** — Works on macOS Ventura, Sonoma, Sequoia (13–15+)
+- **Skywalk / IO80211InfraProtocol support** — Works on macOS Ventura, Sonoma, Sequoia, Tahoe (13–15+)
 - **WMI-TLV control plane** — Complete BMI boot, HTC/HTT transport, firmware-6.bin + board.bin loading
 - **Hardware crypto offload** — AES-CCMP PTK/GTK key installation via firmware
 - **Apple RSN Supplicant delegation** — Native WPA2/WPA3 4-way handshake (no custom supplicant)
@@ -32,10 +32,13 @@ This project delivers two kernel extensions that work together to bring **native
 - **Power management** — Full D0/D3 transitions, sleep/wake recovery
 
 ### Bluetooth (QCABluetoothFirmware)
-- **ROM version detection** — Identifies QCA Rome `0x00000302`
+- **ROM version detection** — Identifies QCA Rome `0x00000302` (QCA9377)
 - **Rampatch + NVM upload** — `rampatch_usb_00000302.bin` + `nvm_usb_00000302.bin`
-- **USB controller soft reset** — Clean handoff to native `IOBluetoothFamily`
-- **Multi-OEM support** — Matches Qualcomm, Lite-On, AzureWave, IMC Networks variants
+- **Linux-parity firmware logic** — Full TLV tag patching (HCI, Deep Sleep, BD_ADDR), rampatch version verification, recovery-friendly equal-version allowance
+- **Suspend/resume support** — Power management registration (`PMinit`), `setPowerState()` for D3→D0 wake, automatic firmware re-upload if lost during sleep
+- **Correct battery reporting** — NVM patch clears erroneous "charging" flag (bit 6) while preserving in-band sleep (bit 7)
+- **Multi-OEM support** — 100+ USB VID/PID entries for Qualcomm, Foxconn, Lite-On, AzureWave, ASUS, and other OEMs
+- **Clean handoff** — Renames device to `"Bluetooth USB Host Controller"` for native `IOBluetoothFamily` matching on macOS 12+
 
 ---
 
@@ -43,8 +46,19 @@ This project delivers two kernel extensions that work together to bring **native
 
 | Chipset | Wi-Fi | Bluetooth | PCIe ID | USB ID |
 |---------|-------|-----------|---------|--------|
-| **QCA9377** | 1×1 802.11ac (433 Mbps) | BT 4.2 / 5.0 | `168C:0042` | `0CF3:E300` |
+| **QCA9377** | 1×1 802.11ac (433 Mbps) | BT 4.2 / 5.0 | `168C:0042` | `0CF3:E300` + OEM variants |
 
+### Bluetooth USB IDs (Qualcomm Atheros 0x0CF3)
+`E300`, `535B`, `E007`, `E009`, `E010`, `E301`, `E360`, `E500`, `E600`, `E700`
+
+### OEM Variants
+| Vendor | VID | Example PIDs |
+|--------|-----|--------------|
+| **Foxconn / Hon Hai** | 0x0489 | E0A2, E092, E09F, E0C7–E0EC, E0FC, E100–E14D |
+| **Lite-On** | 0x04CA | 3011, 3015, 3016, 301A, 3021–3024, 3A22–3A27 |
+| **AzureWave** | 0x13D3 | 3491, 3496, 3501, 3503, 3587, 3601–3624 |
+| **ASUS** | 0x0B05 | 1825, 1868 |
+| **Other** | 0x10AB, 0x28DE, 0x2C7C, 0x35F5 | Various |
 
 Tested on: Acer laptop with QCA9377.
 
@@ -134,10 +148,19 @@ Detailed engineering specifications in [`docs/`](docs/):
 | Wi-Fi not appearing | Kext not loaded / wrong PCIe ID | Check `kextstat \| grep AirportQCA`; verify `IOPCIMatch` in Info.plist |
 | "No hardware installed" | Firmware upload failed | Check `dmesg` for BMI/HTC errors; ensure `firmware-6.bin` + `board.bin` present |
 | Kernel panic on boot | AppleVTD / IOMMU fault | Verify `IOBufferMemoryDescriptor::inTaskWithPhysicalMask` usage; disable AppleVTD in config.plist if needed |
-| Bluetooth not working | Firmware injector didn't match | Add your USB VID/PID to `QCABluetooth/Info.plist`; check `IOUSBHostDevice` probe score |
-| Sleep/wake breaks Wi-Fi | Power management | Implement `setPowerState` D3→D0 transition; re-init CE rings on wake |
+| Bluetooth not working | Firmware injector didn't match | Check `IOUSBHostDevice` probe score; all common OEM IDs now in Info.plist |
+| Bluetooth toggles off on connect | Firmware not transitioning to HCI | Fixed in v1.0.1+: 150ms post-NVM delay allows auto-transition |
+| Device shows "charging" when not | NVM HCI config bit 6 set | Fixed in v1.0.1+: NVM tag 17 patch clears erroneous flag |
+| Bluetooth fails after sleep | Firmware lost during USB power cut | Fixed in v1.0.1+: `setPowerState()` re-uploads firmware on D3→D0 wake |
 
 **Debug logging**: Set boot arg `qca_debug=1` or add `QCADebug=1` to NVRAM for verbose kernel logs.
+```bash
+# Check Bluetooth firmware upload logs
+log show --predicate 'process == "kernel" && (eventMessage CONTAINS "QCABluetooth")' --last 1h
+
+# Verify battery state reporting
+pmset -g accps
+```
 
 ---
 
@@ -153,10 +176,12 @@ Contributions welcome! Please read the [contribution guidelines](CONTRIBUTING.md
 5. Submit PR with description of changes and testing performed
 
 ### Priority Areas
-- [ ] macOS 15 (Sequoia) Skywalk API updates
-- [ ] WPA3 / SAE support
-- [ ] Bluetooth LE audio (LC3 codec)
-- [ ] Additional OEM USB PID support
+- [x] macOS 15 (Sequoia) / Tahoe Skywalk API support
+- [x] WPA3 / SAE support (via Apple RSN Supplicant)
+- [x] Bluetooth suspend/resume firmware re-upload
+- [x] Comprehensive OEM USB PID support (100+ devices)
+- [ ] Bluetooth LE audio (LC3 codec) — **hardware unsupported on QCA9377**
+- [ ] Additional QCA variants (WCN6855, WCN785x) — separate firmware needed
 
 ---
 
