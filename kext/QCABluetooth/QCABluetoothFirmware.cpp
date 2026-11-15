@@ -130,6 +130,21 @@ void QCABluetoothFirmware::stop(IOService *provider)
     super::stop(provider);
 }
 
+/* Rampatch file version structure (matches Linux btqca.h) */
+struct qca_rampatch_version {
+    uint16_t rom_version_high;
+    uint16_t rom_version_low;
+    uint16_t patch_version;
+} __attribute__((packed));
+
+/* NVM tag IDs (matches Linux btqca.h) */
+#define EDL_TAG_ID_BD_ADDR      2
+#define EDL_TAG_ID_HCI          17
+#define EDL_TAG_ID_DEEP_SLEEP   27
+
+/* Rome 3.2 version offset in rampatch file */
+#define ROME_3_2_VER_OFFSET     18
+
 bool QCABluetoothFirmware::uploadFirmware(bool isResume)
 {
     struct qca_version ver;
@@ -172,6 +187,7 @@ bool QCABluetoothFirmware::uploadFirmware(bool isResume)
         return true;
     }
 
+    /* --- RAMPATCH UPLOAD --- */
     if (!(status & QCA_PATCH_UPDATED)) {
         const uint8_t *patch = qca_rampatch_usb_00000302_bin;
         const uint32_t patchSize = qca_rampatch_usb_00000302_bin_len;
@@ -180,12 +196,20 @@ bool QCABluetoothFirmware::uploadFirmware(bool isResume)
             IOLog("QCABluetoothFirmware: bundled rampatch header/version is invalid\n");
             return false;
         }
-        const uint16_t patchVersion = static_cast<uint16_t>(
-            static_cast<uint16_t>(patch[20]) | (static_cast<uint16_t>(patch[21]) << 8));
-        const uint32_t currentPatch = OSSwapLittleToHostInt32(ver.patch_version);
-        if (patchVersion < currentPatch) {
-            IOLog("QCABluetoothFirmware: bundled rampatch 0x%04x is older than controller patch 0x%08x\n",
-                  patchVersion, currentPatch);
+
+        /* Verify rampatch version from file header (Linux-style: read at ver_offset) */
+        const struct qca_rampatch_version *rver = reinterpret_cast<const struct qca_rampatch_version *>(patch + ROME_3_2_VER_OFFSET);
+        uint16_t rver_rom_low = OSSwapLittleToHostInt16(rver->rom_version_low);
+        uint16_t rver_patch = OSSwapLittleToHostInt16(rver->patch_version);
+        uint32_t rver_rom = rver_rom_low;  // Rome 3.2 uses low 16 bits
+        uint32_t currentPatch = OSSwapLittleToHostInt32(ver.patch_version);
+
+        IOLog("QCABluetoothFirmware: rampatch file: rome 0x%x build 0x%x, controller: rome 0x%x build 0x%x\n",
+              rver_rom, rver_patch, romVersion, currentPatch);
+
+        /* Allow equal versions for recovery (Linux behavior) */
+        if (rver_rom != romVersion || rver_patch < currentPatch) {
+            IOLog("QCABluetoothFirmware: rampatch file version did not match with firmware\n");
             return false;
         }
 
@@ -212,12 +236,13 @@ bool QCABluetoothFirmware::uploadFirmware(bool isResume)
         memset(&ver, 0, sizeof(ver));
         if (fUsbController->sendVendorRequestIn(QCA_GET_TARGET_VERSION, &ver, sizeof(ver)) != kIOReturnSuccess ||
             OSSwapLittleToHostInt32(ver.rom_version) != romVersion ||
-            OSSwapLittleToHostInt32(ver.patch_version) < patchVersion) {
+            OSSwapLittleToHostInt32(ver.patch_version) < rver_patch) {
             IOLog("QCABluetoothFirmware: controller did not report the uploaded rampatch\n");
             return false;
         }
     }
 
+    /* --- NVM UPLOAD --- */
     if (!(status & QCA_SYSCFG_UPDATED)) {
         const uint8_t *nvm = qca_nvm_usb_00000302_bin;
         const uint32_t nvmSize = qca_nvm_usb_00000302_bin_len;
@@ -227,9 +252,10 @@ bool QCABluetoothFirmware::uploadFirmware(bool isResume)
         }
 
         /* Create mutable copy for NVM patching.
-         * The NVM contains TLV tags; we need to patch EDL_TAG_ID_HCI (tag 17)
-         * to clear erroneous charging-state flags that cause the controller
-         * to report "charging" when the device is not actually charging. */
+         * The NVM contains TLV tags; we patch:
+         *  - EDL_TAG_ID_HCI (17): enable in-band sleep, clear erroneous charging flag
+         *  - EDL_TAG_ID_DEEP_SLEEP (27): enable deep sleep feature
+         *  - EDL_TAG_ID_BD_ADDR (2): would set custom BD_ADDR (optional) */
         uint8_t *nvmPatched = (uint8_t *)IOMalloc(nvmSize);
         if (!nvmPatched) {
             IOLog("QCABluetoothFirmware: failed to allocate NVM patch buffer\n");
@@ -241,13 +267,22 @@ bool QCABluetoothFirmware::uploadFirmware(bool isResume)
         for (uint32_t offset = QCA_NVM_HEADER_SIZE; offset + 8 < nvmSize;) {
             uint16_t tag_id = *reinterpret_cast<uint16_t *>(nvmPatched + offset);
             uint16_t tag_len = *reinterpret_cast<uint16_t *>(nvmPatched + offset + 2);
-            if (tag_id == 17 && tag_len >= 3) {  /* EDL_TAG_ID_HCI */
-                /* data[0] bit 7 = enable in-band sleep (keep).
+            uint8_t *tag_data = nvmPatched + offset + 8;
+
+            if (tag_id == EDL_TAG_ID_HCI && tag_len >= 3) {  /* tag 17: HCI transport config */
+                /* data[0] bit 7 = enable in-band sleep (keep/set).
                  * Clear bit 6 which may be misinterpreted as "charging" by bluetoothd. */
-                nvmPatched[offset + 8] &= ~0x40;
-                IOLog("QCABluetoothFirmware: patched NVM tag 17 (HCI config), cleared charging flag\n");
-                break;
+                tag_data[0] |= 0x80;   /* enable in-band sleep */
+                tag_data[0] &= ~0x40;  /* clear erroneous charging flag */
+                IOLog("QCABluetoothFirmware: patched NVM tag 17 (HCI config): in-band sleep enabled, charging flag cleared\n");
             }
+            else if (tag_id == EDL_TAG_ID_DEEP_SLEEP && tag_len >= 1) {  /* tag 27: deep sleep */
+                /* data[0] bit 0 = enable deep sleep */
+                tag_data[0] |= 0x01;
+                IOLog("QCABluetoothFirmware: patched NVM tag 27 (DEEP_SLEEP): enabled\n");
+            }
+            /* BD_ADDR (tag 2) patching would go here if custom address needed */
+
             offset += 8 + tag_len;
             if (tag_len == 0) break;
         }
@@ -272,12 +307,13 @@ bool QCABluetoothFirmware::uploadFirmware(bool isResume)
             offset += chunk;
         }
         IOFree(nvmPatched, nvmSize);
+
+        /* Wait for controller to apply NVM (Linux: 100ms for WCN6855 2.1+) */
+        IODelay(100000);  /* 100ms */
     }
 
     uint8_t finalStatus = 0;
-    /* Allow controller time to auto-transition from DFU to HCI mode after NVM upload.
-     * For Rome 3.2, the controller should transition autonomously.
-     * WCN6855 2.1+ requires ~100ms; we wait longer to be safe. */
+    /* Allow controller time to auto-transition from DFU to HCI mode after NVM upload. */
     IODelay(150000);  /* 150ms */
 
     ret = fUsbController->sendVendorRequestIn(QCA_CHECK_STATUS, &finalStatus, sizeof(finalStatus));
