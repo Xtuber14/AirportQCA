@@ -21,6 +21,7 @@ bool QCABluetoothFirmware::init(OSDictionary *dictionary)
     fUsbController = nullptr;
     fVendorID = 0;
     fProductID = 0;
+    fFirmwareUploaded = false;
     IOLog("QCABluetoothFirmware: driver init\n");
     return true;
 }
@@ -80,6 +81,12 @@ bool QCABluetoothFirmware::start(IOService *provider)
         return false;
     }
 
+    /* Register for power management to handle suspend/resume.
+     * QCA Rome firmware is stored in RAM and lost when USB power is cut during sleep.
+     * We need to re-upload firmware on wake (D3->D0 transition). */
+    PMinit();
+    provider->joinPMtree(this);
+
     fUsbController = new QCAUSBController();
     if (!fUsbController || !fUsbController->initWithDevice(this, fDevice)) {
         IOLog("QCABluetoothFirmware: failed to init USB controller\n");
@@ -92,10 +99,10 @@ bool QCABluetoothFirmware::start(IOService *provider)
         return false;
     }
 
-    bool success = uploadFirmware();
+    bool success = uploadFirmware(false);
     publishProperties(success);
 
-    /* Clean up controller instance */
+    /* Clean up controller instance - but keep device open for power management */
     if (fUsbController) {
         fUsbController->release();
         fUsbController = nullptr;
@@ -108,7 +115,10 @@ bool QCABluetoothFirmware::start(IOService *provider)
         return false;
     }
 
-    /* Handoff: close device so Apple's native Bluetooth stack can claim it. */
+    fFirmwareUploaded = true;
+
+    /* Handoff: close device so Apple's native Bluetooth stack can claim it.
+     * We keep the driver attached for power management (setPowerState will be called on wake). */
     fDevice->close(this);
     IOLog("QCABluetoothFirmware: firmware upload reported complete; device handed off to native macOS Bluetooth\n");
     return true;
@@ -116,10 +126,11 @@ bool QCABluetoothFirmware::start(IOService *provider)
 
 void QCABluetoothFirmware::stop(IOService *provider)
 {
+    PMstop();
     super::stop(provider);
 }
 
-bool QCABluetoothFirmware::uploadFirmware()
+bool QCABluetoothFirmware::uploadFirmware(bool isResume)
 {
     struct qca_version ver;
     memset(&ver, 0, sizeof(ver));
@@ -131,14 +142,21 @@ bool QCABluetoothFirmware::uploadFirmware()
     }
 
     const uint32_t romVersion = OSSwapLittleToHostInt32(ver.rom_version);
-    IOLog("QCABluetoothFirmware: detected ROM version 0x%08x, patch 0x%08x\n",
-          romVersion, OSSwapLittleToHostInt32(ver.patch_version));
+    if (!isResume) {
+        IOLog("QCABluetoothFirmware: detected ROM version 0x%08x, patch 0x%08x\n",
+              romVersion, OSSwapLittleToHostInt32(ver.patch_version));
+    } else {
+        IOLog("QCABluetoothFirmware: [resume] detected ROM version 0x%08x, patch 0x%08x\n",
+              romVersion, OSSwapLittleToHostInt32(ver.patch_version));
+    }
 
     if (romVersion != 0x00000302) {
         IOLog("QCABluetoothFirmware: unsupported Rome ROM version 0x%08x\n", romVersion);
         return false;
     }
-    IOLog("QCABluetoothFirmware: verified QCA Rome 3.2 / QCA9377 hardware\n");
+    if (!isResume) {
+        IOLog("QCABluetoothFirmware: verified QCA Rome 3.2 / QCA9377 hardware\n");
+    }
 
     /* Query status to determine if patch is required */
     uint8_t status = 0;
@@ -146,6 +164,12 @@ bool QCABluetoothFirmware::uploadFirmware()
     if (ret != kIOReturnSuccess) {
         IOLog("QCABluetoothFirmware: failed to query status (0x%08x)\n", ret);
         return false;
+    }
+
+    /* If firmware is already loaded (e.g. survived sleep), skip upload */
+    if ((status & (QCA_PATCH_UPDATED | QCA_SYSCFG_UPDATED)) == (QCA_PATCH_UPDATED | QCA_SYSCFG_UPDATED)) {
+        IOLog("QCABluetoothFirmware: firmware already loaded (status=0x%02x), skipping upload\n", status);
+        return true;
     }
 
     if (!(status & QCA_PATCH_UPDATED)) {
@@ -347,4 +371,92 @@ void QCABluetoothFirmware::publishProperties(bool success)
         fDevice->setName("Bluetooth USB Host Controller");
         IOLog("QCABluetoothFirmware: device renamed to 'Bluetooth USB Host Controller'\n");
     }
+}
+
+/* Check if firmware upload is needed by querying controller status.
+ * Returns true if rampatch and/or NVM need to be uploaded. */
+bool QCABluetoothFirmware::checkFirmwareNeeded()
+{
+    if (!fUsbController) return false;
+
+    struct qca_version ver;
+    memset(&ver, 0, sizeof(ver));
+    IOReturn ret = fUsbController->sendVendorRequestIn(QCA_GET_TARGET_VERSION, &ver, sizeof(ver));
+    if (ret != kIOReturnSuccess) {
+        IOLog("QCABluetoothFirmware: [check] failed to get target version (0x%08x)\n", ret);
+        return false;
+    }
+
+    uint8_t status = 0;
+    ret = fUsbController->sendVendorRequestIn(QCA_CHECK_STATUS, &status, sizeof(status));
+    if (ret != kIOReturnSuccess) {
+        IOLog("QCABluetoothFirmware: [check] failed to query status (0x%08x)\n", ret);
+        return false;
+    }
+
+    bool needed = (status & (QCA_PATCH_UPDATED | QCA_SYSCFG_UPDATED)) != (QCA_PATCH_UPDATED | QCA_SYSCFG_UPDATED);
+    IOLog("QCABluetoothFirmware: [check] status=0x%02x, firmware needed=%d\n", status, needed);
+    return needed;
+}
+
+/* Power management: handle D3->D0 transition (wake from sleep).
+ * QCA Rome firmware is in RAM and lost when USB power is cut during sleep.
+ * On wake, the controller reverts to DFU mode and needs firmware re-upload. */
+IOReturn QCABluetoothFirmware::setPowerState(unsigned long powerStateOrdinal, IOService *whatDevice)
+{
+    IOLog("QCABluetoothFirmware: setPowerState(%lu)\n", powerStateOrdinal);
+
+    /* powerStateOrdinal: 0 = off (D3), 1 = on (D0) */
+    if (powerStateOrdinal == 1) {
+        /* Wake from sleep (D3->D0) */
+        if (fFirmwareUploaded && fDevice) {
+            IOLog("QCABluetoothFirmware: wake detected, checking firmware status\n");
+
+            /* Re-open device for firmware operations */
+            if (!fDevice->open(this)) {
+                IOLog("QCABluetoothFirmware: [wake] failed to re-open device\n");
+                return IOPMAckImplied;
+            }
+
+            /* Re-init USB controller */
+            if (fUsbController) {
+                fUsbController->release();
+                fUsbController = nullptr;
+            }
+            fUsbController = new QCAUSBController();
+            if (!fUsbController || !fUsbController->initWithDevice(this, fDevice)) {
+                IOLog("QCABluetoothFirmware: [wake] failed to init USB controller\n");
+                if (fUsbController) {
+                    fUsbController->release();
+                    fUsbController = nullptr;
+                }
+                fDevice->close(this);
+                return IOPMAckImplied;
+            }
+
+            /* Check if firmware re-upload is needed */
+            if (checkFirmwareNeeded()) {
+                IOLog("QCABluetoothFirmware: [wake] firmware lost, re-uploading\n");
+                bool success = uploadFirmware(true);
+                if (success) {
+                    IOLog("QCABluetoothFirmware: [wake] firmware re-upload successful\n");
+                } else {
+                    IOLog("QCABluetoothFirmware: [wake] firmware re-upload FAILED\n");
+                }
+            } else {
+                IOLog("QCABluetoothFirmware: [wake] firmware intact, no re-upload needed\n");
+            }
+
+            /* Clean up controller */
+            if (fUsbController) {
+                fUsbController->release();
+                fUsbController = nullptr;
+            }
+
+            /* Close device - native stack will reclaim it */
+            fDevice->close(this);
+        }
+    }
+
+    return IOPMAckImplied;
 }

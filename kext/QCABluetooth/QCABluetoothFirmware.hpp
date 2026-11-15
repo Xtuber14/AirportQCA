@@ -24,16 +24,19 @@ public:
     virtual IOService* probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
     virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn setPowerState(unsigned long powerStateOrdinal, IOService *whatDevice) APPLE_KEXT_OVERRIDE;
 
 private:
-    bool uploadFirmware();
+    bool uploadFirmware(bool isResume = false);
     void publishProperties(bool success);
     void writeBluetoothNVRAM();
+    bool checkFirmwareNeeded();
 
     IOUSBHostDevice   *fDevice;
     QCAUSBController  *fUsbController;
     uint16_t           fVendorID;
     uint16_t           fProductID;
+    bool               fFirmwareUploaded;
 };
 
 #endif /* _QCA_BLUETOOTH_FIRMWARE_HPP_ */
