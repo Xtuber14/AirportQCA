@@ -130,23 +130,42 @@ void QCABluetoothFirmware::stop(IOService *provider)
     super::stop(provider);
 }
 
-/* Rampatch file version structure (matches Linux btqca.h) */
-struct qca_rampatch_version {
-    uint16_t rom_version_high;
-    uint16_t rom_version_low;
-    uint16_t patch_version;
-} __attribute__((packed));
+/* Device info table (matches Linux btusb_main.c qca_devices_table) */
+static const struct qca_device_info qca_devices_table[] = {
+    { QCA_ROME_1_0,     20, 4,  8 },  /* Rome 1.0 */
+    { QCA_ROME_1_1,     20, 4,  8 },  /* Rome 1.1 */
+    { QCA_ROME_2_0,     28, 4, 16 },  /* Rome 2.0 */
+    { QCA_ROME_2_1,     28, 4, 16 },  /* Rome 2.1 */
+    { QCA_ROME_3_0,     28, 4, 16 },  /* Rome 3.0 */
+    { QCA_ROME_3_2,     28, 4, 16 },  /* Rome 3.2 (QCA9377) */
+    { QCA_WCN6855_1_0,  40, 4, 16 },  /* WCN6855 1.0 */
+    { QCA_WCN6855_2_0,  40, 4, 16 },  /* WCN6855 2.0 */
+    { QCA_WCN6855_2_1,  40, 4, 16 },  /* WCN6855 2.1 */
+    { QCA_WCN785X_2_0,  40, 4, 16 },  /* WCN785x 2.0 */
+};
 
-/* NVM tag IDs (matches Linux btqca.h) */
-#define EDL_TAG_ID_BD_ADDR      2
-#define EDL_TAG_ID_HCI          17
-#define EDL_TAG_ID_DEEP_SLEEP   27
+const struct qca_device_info* QCABluetoothFirmware::lookupDeviceInfo(uint32_t romVersion)
+{
+    for (size_t i = 0; i < sizeof(qca_devices_table) / sizeof(qca_devices_table[0]); i++) {
+        if (qca_devices_table[i].rom_version == romVersion) {
+            return &qca_devices_table[i];
+        }
+    }
+    return nullptr;
+}
 
-/* Version flags (matches Linux btusb_main.c) */
-#define QCA_FLAG_MULTI_NVM      0x80
+/* Custom firmware subdirectory table (matches Linux btusb_main.c) */
+struct qca_custom_firmware {
+    uint32_t rom_version;
+    uint16_t board_id;
+    const char *subdirectory;
+};
 
-/* Rome 3.2 version offset in rampatch file */
-#define ROME_3_2_VER_OFFSET     18
+static const struct qca_custom_firmware qca_custom_btfws[] = {
+    { QCA_WCN6855_2_1, 0x030A, "QCA2066" },
+    { QCA_WCN6855_2_1, 0x030B, "QCA2066" },
+    { 0, 0, nullptr }
+};
 
 bool QCABluetoothFirmware::uploadFirmware(bool isResume)
 {
@@ -168,12 +187,20 @@ bool QCABluetoothFirmware::uploadFirmware(bool isResume)
               romVersion, OSSwapLittleToHostInt32(ver.patch_version));
     }
 
-    if (romVersion != 0x00000302) {
+    /* Look up device info for this ROM version */
+    const struct qca_device_info *info = lookupDeviceInfo(romVersion);
+    if (!info) {
+        if (romVersion & ~0xffffU) {
+            IOLog("QCABluetoothFirmware: high ROM version 0x%08x - assuming no patch needed\n", romVersion);
+            return true;
+        }
         IOLog("QCABluetoothFirmware: unsupported Rome ROM version 0x%08x\n", romVersion);
         return false;
     }
+
     if (!isResume) {
-        IOLog("QCABluetoothFirmware: verified QCA Rome 3.2 / QCA9377 hardware\n");
+        IOLog("QCABluetoothFirmware: verified QCA ROM version 0x%08x (rampatch_hdr=%u, nvm_hdr=%u, ver_offset=%u)\n",
+              romVersion, info->rampatch_hdr, info->nvm_hdr, info->ver_offset);
     }
 
     /* Query status to determine if patch is required */
@@ -201,10 +228,16 @@ bool QCABluetoothFirmware::uploadFirmware(bool isResume)
         }
 
         /* Verify rampatch version from file header (Linux-style: read at ver_offset) */
-        const struct qca_rampatch_version *rver = reinterpret_cast<const struct qca_rampatch_version *>(patch + ROME_3_2_VER_OFFSET);
+        const struct qca_rampatch_version *rver = reinterpret_cast<const struct qca_rampatch_version *>(patch + info->ver_offset);
         uint16_t rver_rom_low = OSSwapLittleToHostInt16(rver->rom_version_low);
         uint16_t rver_patch = OSSwapLittleToHostInt16(rver->patch_version);
-        uint32_t rver_rom = rver_rom_low;  // Rome 3.2 uses low 16 bits
+        uint32_t rver_rom;
+        if (romVersion & ~0xffffU) {
+            uint16_t rver_rom_high = OSSwapLittleToHostInt16(rver->rom_version_high);
+            rver_rom = ((uint32_t)rver_rom_high << 16) | rver_rom_low;
+        } else {
+            rver_rom = rver_rom_low;
+        }
         uint32_t currentPatch = OSSwapLittleToHostInt32(ver.patch_version);
 
         IOLog("QCABluetoothFirmware: rampatch file: rome 0x%x build 0x%x, controller: rome 0x%x build 0x%x\n",
@@ -216,13 +249,13 @@ bool QCABluetoothFirmware::uploadFirmware(bool isResume)
             return false;
         }
 
-        IOLog("QCABluetoothFirmware: uploading Rome 3.2 rampatch (%u bytes)\n", patchSize);
-        if (fUsbController->sendVendorRequestOut(QCA_DFU_DOWNLOAD, patch, QCA_DFU_HEADER_SIZE) != kIOReturnSuccess) {
+        IOLog("QCABluetoothFirmware: uploading rampatch (%u bytes, hdr=%u)\n", patchSize, info->rampatch_hdr);
+        if (fUsbController->sendVendorRequestOut(QCA_DFU_DOWNLOAD, patch, info->rampatch_hdr) != kIOReturnSuccess) {
             IOLog("QCABluetoothFirmware: failed to send rampatch header\n");
             return false;
         }
         IODelay(20000);
-        for (uint32_t offset = QCA_DFU_HEADER_SIZE; offset < patchSize;) {
+        for (uint32_t offset = info->rampatch_hdr; offset < patchSize;) {
             const uint32_t chunk = (patchSize - offset > QCA_DFU_PACKET_SIZE)
                 ? QCA_DFU_PACKET_SIZE : patchSize - offset;
             IOReturn result = fUsbController->bulkWrite(patch + offset, chunk, 3000);
@@ -247,31 +280,52 @@ bool QCABluetoothFirmware::uploadFirmware(bool isResume)
 
     /* --- NVM UPLOAD --- */
     if (!(status & QCA_SYSCFG_UPDATED)) {
-        /* Extract board_id from controller version for board-specific NVM loading */
-        uint16_t boardId = extractBoardId(&ver);
-        if (boardId) {
-            IOLog("QCABluetoothFirmware: detected board_id=0x%04x, trying board-specific NVM\n", boardId);
+        /* Select NVM file based on ROM version */
+        const uint8_t *nvm;
+        uint32_t nvmSize;
+
+        if (romVersion == QCA_ROME_3_2) {
+            nvm = qca_nvm_usb_00000302_bin;
+            nvmSize = qca_nvm_usb_00000302_bin_len;
+        } else if (romVersion == QCA_ROME_3_0) {
+            nvm = qca_nvm_usb_00000302_bin;  /* fallback */
+            nvmSize = qca_nvm_usb_00000302_bin_len;
+        } else if (romVersion == QCA_ROME_2_0 || romVersion == QCA_ROME_2_1) {
+            nvm = qca_nvm_usb_00000201_bin;  /* 2.0/2.1 share NVM */
+            nvmSize = qca_nvm_usb_00000201_bin_len;
+        } else if (romVersion == QCA_ROME_1_0 || romVersion == QCA_ROME_1_1) {
+            nvm = qca_nvm_usb_00000101_bin;  /* 1.0/1.1 share NVM */
+            nvmSize = qca_nvm_usb_00000101_bin_len;
+        } else if (romVersion >= QCA_WCN6855_1_0 && romVersion <= QCA_WCN6855_2_1) {
+            /* WCN6855 variants - use board-specific if available */
+            nvm = qca_nvm_usb_00130201_bin;  /* default WCN6855 NVM */
+            nvmSize = qca_nvm_usb_00130201_bin_len;
+        } else if (romVersion == QCA_WCN785X_2_0) {
+            nvm = qca_nvm_usb_00190200_bin;
+            nvmSize = qca_nvm_usb_00190200_bin_len;
+        } else {
+            nvm = qca_nvm_usb_00000302_bin;
+            nvmSize = qca_nvm_usb_00000302_bin_len;
         }
 
-        const uint8_t *nvm = qca_nvm_usb_00000302_bin;
-        const uint32_t nvmSize = qca_nvm_usb_00000302_bin_len;
         if (nvmSize <= QCA_NVM_HEADER_SIZE) {
-            IOLog("QCABluetoothFirmware: bundled NVM image is invalid\n");
+            IOLog("QCABluetoothFirmware: bundled NVM image is invalid (size=%u)\n", nvmSize);
             return false;
         }
 
-        /* Try board-specific NVM first if board_id available.
-         * We patch the same TLV tags into the board-specific NVM if it exists. */
+        /* Extract board_id from controller version for board-specific NVM loading */
+        uint16_t boardId = extractBoardId(&ver);
+        if (boardId) {
+            IOLog("QCABluetoothFirmware: detected board_id=0x%04x\n", boardId);
+        }
+
+        /* For now we use the generic NVM and patch it.
+         * Board-specific NVM files are bundled but would need dynamic loading. */
         const uint8_t *nvmToUse = nvm;
+        uint32_t nvmSizeToUse = nvmSize;
 
         if (boardId) {
-            char boardNvmName[64];
-            generateNvmFileName(boardNvmName, sizeof(boardNvmName), romVersion, boardId);
-            IOLog("QCABluetoothFirmware: checking for board-specific NVM: %s\n", boardNvmName);
-            /* Note: In this kext, we only have the generic NVM bundled.
-             * For board-specific NVM support, additional firmware files would need to be bundled.
-             * For now, we use the generic NVM and patch it. */
-            IOLog("QCABluetoothFirmware: using generic NVM (board-specific not bundled), board_id=0x%04x\n", boardId);
+            IOLog("QCABluetoothFirmware: detected board_id=0x%04x (board-specific NVM not yet dynamically loaded)\n", boardId);
         }
 
         /* Create mutable copy for NVM patching.
@@ -279,12 +333,12 @@ bool QCABluetoothFirmware::uploadFirmware(bool isResume)
          *  - EDL_TAG_ID_HCI (17): enable in-band sleep, clear erroneous charging flag
          *  - EDL_TAG_ID_DEEP_SLEEP (27): enable deep sleep feature
          *  - EDL_TAG_ID_BD_ADDR (2): would set custom BD_ADDR (optional) */
-        uint8_t *nvmPatched = (uint8_t *)IOMalloc(nvmSize);
+        uint8_t *nvmPatched = (uint8_t *)IOMalloc(nvmSizeToUse);
         if (!nvmPatched) {
             IOLog("QCABluetoothFirmware: failed to allocate NVM patch buffer\n");
             return false;
         }
-        memcpy(nvmPatched, nvmToUse, nvmSize);
+        memcpy(nvmPatched, nvmToUse, nvmSizeToUse);
 
         /* Parse TLV tags: [4-byte header][tag_id(2) tag_len(2) reserve1(4) reserve2(4) data[]]... */
         for (uint32_t offset = QCA_NVM_HEADER_SIZE; offset + 8 < nvmSize;) {

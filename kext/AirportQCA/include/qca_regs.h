@@ -46,6 +46,10 @@
 #define SOC_LF_TIMER_CONTROL0_ENABLE_MASK   0x00000004
 
 #define SOC_CHIP_ID_ADDRESS                 0x000000F0
+
+/* Scratch register 3 (ath10k qca6174_regs.scratch_3_address): the target
+   uses it for firmware indications, so it is sampled as a diagnostic. */
+#define SCRATCH_3_ADDRESS                   0x00000028
 #define SOC_CHIP_ID_REV_MASK                0x0000000F
 
 /* PCIe SoC wake and RTC power state (qca6174/qca9377 pci_ps support).
@@ -196,6 +200,85 @@ static inline int _qcaLsb(u32 mask)
 #define HI_BOARD_DATA_OFFSET                0x00000054
 #define HI_BOARD_DATA_INITIALIZED_OFFSET    0x00000058
 #define HI_FW_SWAP_OFFSET                   0x00000104
+
+/* Additional host-interest fields used by the early configuration
+   (ath10k targaddrs.h, struct host_interest). */
+#define HI_OPTION_FLAG2_OFFSET              0x000000CC
+#define HI_INTERCONNECT_STATE_OFFSET        0x000000F8
+#define HI_EARLY_ALLOC_OFFSET               0x00000100
+
+/* hi_option_flag2 options (ath10k targaddrs.h). */
+#define HI_OPTION_EARLY_CFG_DONE            0x00000010
+
+/* Early allocation (hi_early_alloc): the host tells the target that it
+   supports the early allocation and how many IRAM banks it may use. */
+#define HI_EARLY_ALLOC_MAGIC                0x00006D8A
+#define HI_EARLY_ALLOC_MAGIC_MASK           0xFFFF0000
+#define HI_EARLY_ALLOC_MAGIC_SHIFT          16
+#define HI_EARLY_ALLOC_IRAM_BANKS_MASK      0x0000000F
+#define HI_EARLY_ALLOC_IRAM_BANKS_SHIFT     0
+
+/* Number of IRAM banks the QCA9377 target has
+   (ath10k_pci_get_num_banks for QCA9377_1_0_DEVICE_ID). */
+#define QCA9377_IRAM_BANKS                  9
+
+/* struct pcie_state (ath10k pci.h): the target hands the host the
+   addresses of the pipe configuration and of the service-to-pipe map. */
+#define PCIE_STATE_PIPE_CFG_ADDR_OFFSET     0x00000000
+#define PCIE_STATE_SVC_TO_PIPE_MAP_OFFSET   0x00000004
+#define PCIE_STATE_CONFIG_FLAGS_OFFSET      0x00000020
+#define PCIE_CONFIG_FLAG_ENABLE_L1          0x00000001
+
+/* Pipe directions (ath10k ce.h). The directions are relative to the
+   host, so PIPEDIR_OUT means host -> target. */
+#define PIPEDIR_NONE                        0
+#define PIPEDIR_IN                          1
+#define PIPEDIR_OUT                         2
+#define PIPEDIR_INOUT                       3
+
+/* Target-side Copy Engine configuration (struct ce_pipe_config). The
+   structure is shared between the host driver and the target
+   firmware, so the field order must not change. */
+struct qca_ce_pipe_config {
+    u32 pipenum;
+    u32 pipedir;
+    u32 nentries;
+    u32 nbytes_max;
+    u32 flags;
+    u32 reserved;
+};
+
+/* Service-to-pipe map (struct ce_service_to_pipe), also shared with
+   the target firmware. */
+struct qca_ce_service_to_pipe {
+    u32 service_id;
+    u32 pipedir;
+    u32 pipenum;
+};
+
+/* HTC service ids (ath10k htc.h, SVC(group, idx) = group << 8 | idx). */
+#define ATH10K_HTC_SVC_ID_RSVD_CTRL         0x0001
+#define ATH10K_HTC_SVC_ID_WMI_CONTROL       0x0100
+#define ATH10K_HTC_SVC_ID_WMI_DATA_BE       0x0101
+#define ATH10K_HTC_SVC_ID_WMI_DATA_BK       0x0102
+#define ATH10K_HTC_SVC_ID_WMI_DATA_VI       0x0103
+#define ATH10K_HTC_SVC_ID_WMI_DATA_VO       0x0104
+#define ATH10K_HTC_SVC_ID_HTT_DATA_MSG      0x0300
+#define ATH10K_HTC_SVC_ID_TEST_RAW_STREAMS  0xFE00
+
+/* Number of target Copy Engine configuration entries the QCA6174
+   family expects (ath10k qca6174_values.num_target_ce_config_wlan). */
+#define NUM_TARGET_CE_CONFIG_WLAN           7
+
+/* Diagnostic window (CE7) transfer limit and pipe number
+   (ath10k pci.h / pci.c). */
+#define DIAG_TRANSFER_LIMIT                 2048
+#define CE_DIAG_PIPE                        7
+
+/* ath10k waits at most 10 ms for the diagnostic window to complete a
+   transfer, polling every 50 us. */
+#define DIAG_ACCESS_CE_WAIT_US              50
+#define DIAG_ACCESS_CE_TIMEOUT_US           10000
 
 #define HTC_PROTOCOL_VERSION                0x00000002
 #define HI_OPTION_NUM_DEV_SHIFT             0x9

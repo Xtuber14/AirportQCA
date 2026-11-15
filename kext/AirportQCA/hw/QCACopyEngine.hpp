@@ -36,6 +36,12 @@ public:
     int send(u32 pipeId, void *buf, u32 len);
     int recv(u32 pipeId, void *buf, u32 *len);
 
+    /* Diagnostic window (CE7): move data between the host and the
+       target's address space before the operational firmware runs.
+       ath10k_pci_diag_read_mem / ath10k_pci_diag_write_mem. */
+    int diagReadMem(u32 targetAddr, void *buf, u32 len);
+    int diagWriteMem(u32 targetAddr, const void *buf, u32 len);
+
 private:
     struct CEPipe {
         u32 pipeId;
@@ -71,6 +77,11 @@ private:
     CEPipe fPipes[CE_COUNT];
 
     void releasePending(CEPipe &pipe);
+
+    /* Diagnostic window helpers (CE7). */
+    int diagSendRaw(u32 addr, u32 len, u32 flags);
+    int diagPostDest(u32 addr);
+    int diagWaitRecv(u32 len);
 };
 
 #endif /* _QCA_COPY_ENGINE_HPP_ */

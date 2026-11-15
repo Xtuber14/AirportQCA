@@ -132,6 +132,11 @@ void QCACopyEngine::startPipes()
         if (!pipe.srcEntries && !pipe.destEntries) continue;
         const u32 base = pipe.baseOffset;
 
+        /* The CTRL1 read-back tells whether the copy engine really
+           presented its reset value (0x80) to the host or whether the
+           target cleared it while it initialized the engine. */
+        const u32 ctrl1Pre = fPci->read32(base + CE_CTRL1_OFFSET);
+
         if (pipe.srcEntries) {
             fPci->write32(base + CE_SRC_RING_BASE_ADDR_OFFSET, (u32)pipe.srcRingPhys);
             fPci->write32(base + CE_SRC_RING_SZ_OFFSET, pipe.srcEntries);
@@ -171,16 +176,26 @@ void QCACopyEngine::startPipes()
         pipe.dstRdIdx = 0;
         pipe.dstWrIdx = 0;
         if (pipe.destEntries) {
-            /* Leave one slot empty to distinguish a full ring from an empty one. */
-            const u32 postCount = pipe.destEntries - 1;
-            for (u32 n = 0; n < postCount; ++n) {
-                pipe.dstRing[n].addr = cpu_to_le32((u32)(pipe.dstBufferPhys + (size_t)n * pipe.maxBufSize));
-                pipe.dstRing[n].nbytes = 0;
-                pipe.dstRing[n].flags = 0;
+            if (i == CE_DIAG_PIPE) {
+                /* The diagnostic window owns its destination ring:
+                   ath10k posts the bounce buffer for every transfer, so
+                   no buffer is queued up front. */
+                memset(pipe.dstRing, 0, pipe.destEntries * sizeof(struct ce_desc));
+                OSSynchronizeIO();
+                pipe.dstWrIdx = 0;
+                fPci->write32(base + CE_DST_WR_INDEX_OFFSET, 0);
+            } else {
+                /* Leave one slot empty to distinguish a full ring from an empty one. */
+                const u32 postCount = pipe.destEntries - 1;
+                for (u32 n = 0; n < postCount; ++n) {
+                    pipe.dstRing[n].addr = cpu_to_le32((u32)(pipe.dstBufferPhys + (size_t)n * pipe.maxBufSize));
+                    pipe.dstRing[n].nbytes = 0;
+                    pipe.dstRing[n].flags = 0;
+                }
+                OSSynchronizeIO();
+                pipe.dstWrIdx = postCount;
+                fPci->write32(base + CE_DST_WR_INDEX_OFFSET, pipe.dstWrIdx);
             }
-            OSSynchronizeIO();
-            pipe.dstWrIdx = postCount;
-            fPci->write32(base + CE_DST_WR_INDEX_OFFSET, pipe.dstWrIdx);
         }
         fPci->write32(base + CE_SRC_WR_INDEX_OFFSET, 0);
 
@@ -190,6 +205,13 @@ void QCACopyEngine::startPipes()
         fPci->setDiagProp("QCACECtrl1Sz", pipe.srcEntries | (pipe.destEntries << 16));
         fPci->setDiagProp("QCACESrcWm", fPci->read32(base + CE_SRC_WM_OFFSET));
         fPci->setDiagProp("QCACEDstWm", fPci->read32(base + CE_DST_WM_OFFSET));
+        {
+            char key[32];
+            snprintf(key, sizeof(key), "QCACeCtrl1Pre%u", i);
+            fPci->setDiagProp(key, ctrl1Pre);
+            snprintf(key, sizeof(key), "QCACeCtrl1Post%u", i);
+            fPci->setDiagProp(key, fPci->read32(base + CE_CTRL1_OFFSET));
+        }
     }
 }
 
@@ -290,6 +312,168 @@ void QCACopyEngine::releasePending(CEPipe &pipe)
         pipe.pendingDma->release();
         pipe.pendingDma = nullptr;
     }
+}
+
+/* Post a descriptor on the diagnostic window's source ring without
+   copying any data. The descriptor address is used verbatim, which is
+   what lets the window address the target's memory space
+   (ath10k_ce_send with a NULL buffer). The descriptor's metadata field
+   carries the transfer id, which is 0 for the diagnostic window. */
+int QCACopyEngine::diagSendRaw(u32 addr, u32 len, u32 flags)
+{
+    CEPipe &pipe = fPipes[CE_DIAG_PIPE];
+    if (!pipe.srcEntries || !pipe.srcRing || !len || len > pipe.maxBufSize) return -1;
+
+    const u32 base = pipe.baseOffset;
+    const u32 mask = pipe.srcEntries - 1;
+    const u32 next = (pipe.srcWrIdx + 1) & mask;
+    int timeout = 100;
+    while (next == (fPci->read32(base + CE_SRC_RD_INDEX_OFFSET) & mask) && timeout-- > 0)
+        qca_mdelay(1);
+    if (timeout <= 0) return -1;
+
+    struct ce_desc &desc = pipe.srcRing[pipe.srcWrIdx];
+    desc.addr = cpu_to_le32(addr);
+    desc.nbytes = cpu_to_le16((u16)len);
+    desc.flags = cpu_to_le16((u16)flags);
+    OSSynchronizeIO();
+    pipe.srcWrIdx = next;
+    fPci->write32(base + CE_SRC_WR_INDEX_OFFSET, next);
+
+    /* Wait for the Copy Engine to fetch the descriptor. ath10k detects
+       the completion of a transfer the same way: the hardware advances
+       the source ring's read index. */
+    timeout = 100;
+    u32 rdIdx = fPci->read32(base + CE_SRC_RD_INDEX_OFFSET);
+    while ((rdIdx & mask) != next && timeout-- > 0) {
+        qca_mdelay(1);
+        rdIdx = fPci->read32(base + CE_SRC_RD_INDEX_OFFSET);
+    }
+    if (timeout <= 0) {
+        fPci->setDiagProp("QCADiagSendStall", rdIdx);
+        return -1;
+    }
+    return 0;
+}
+
+/* Post a destination descriptor on the diagnostic window's destination
+   ring (ath10k_ce_rx_post_buf). */
+int QCACopyEngine::diagPostDest(u32 addr)
+{
+    CEPipe &pipe = fPipes[CE_DIAG_PIPE];
+    if (!pipe.destEntries || !pipe.dstRing) return -1;
+
+    const u32 base = pipe.baseOffset;
+    const u32 mask = pipe.destEntries - 1;
+    const u32 next = (pipe.dstWrIdx + 1) & mask;
+    int timeout = 100;
+    while (next == (fPci->read32(base + CE_DST_RD_INDEX_OFFSET) & mask) && timeout-- > 0)
+        qca_mdelay(1);
+    if (timeout <= 0) return -1;
+
+    struct ce_desc &desc = pipe.dstRing[pipe.dstWrIdx];
+    desc.addr = cpu_to_le32(addr);
+    desc.nbytes = 0;
+    desc.flags = 0;
+    OSSynchronizeIO();
+    pipe.dstWrIdx = next;
+    fPci->write32(base + CE_DST_WR_INDEX_OFFSET, pipe.dstWrIdx);
+    return 0;
+}
+
+/* Wait for the diagnostic window to deliver the requested bytes. The
+   completion is signalled by the destination descriptor's length field
+   (ath10k_ce_completed_recv_next). */
+int QCACopyEngine::diagWaitRecv(u32 len)
+{
+    CEPipe &pipe = fPipes[CE_DIAG_PIPE];
+    if (!pipe.dstRing) return -1;
+
+    int timeout = 100;
+    struct ce_desc &desc = pipe.dstRing[pipe.dstRdIdx];
+    while (le16_to_cpu(desc.nbytes) == 0 && timeout-- > 0)
+        qca_mdelay(1);
+    if (timeout <= 0) {
+        fPci->setDiagProp("QCADiagRecvStall", pipe.dstRdIdx);
+        return -1;
+    }
+
+    u16 received = le16_to_cpu(desc.nbytes);
+    desc.nbytes = 0;
+    desc.flags = 0;
+    pipe.dstRdIdx = (pipe.dstRdIdx + 1) % pipe.destEntries;
+    return received == len ? 0 : -1;
+}
+
+/* Read target memory through the diagnostic window
+   (ath10k_pci_diag_read_mem).
+
+   The window is a copy engine with a special protocol: the source
+   descriptor names the *target* address to read from and the destination
+   descriptor names the *host* buffer that receives the data. */
+int QCACopyEngine::diagReadMem(u32 targetAddr, void *buf, u32 len)
+{
+    if (!buf || !len || len > DIAG_TRANSFER_LIMIT) return -1;
+
+    /* Bounce buffer: 4-byte aligned and in DMA-able space. */
+    IOBufferMemoryDescriptor *dma = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, kIODirectionInOut | kIOMemoryHostPhysicallyContiguous,
+        len, 0x00000000FFFFFFFFULL);
+    if (!dma) return -1;
+    if (dma->prepare() != kIOReturnSuccess) { dma->release(); return -1; }
+
+    UInt8 *data = (UInt8 *)dma->getBytesNoCopy();
+    dma_addr_t phys = dma->getPhysicalAddress();
+    if (!data || phys > 0xffffffffULL) {
+        dma->complete(); dma->release(); return -1;
+    }
+    memset(data, 0, len);
+
+    u32 ceAddr = fPci->targCpuToCeAddr(targetAddr);
+
+    int ret = diagPostDest((u32)phys);
+    if (ret == 0) ret = diagSendRaw(ceAddr, len, 0);
+    if (ret == 0) ret = diagWaitRecv(len);
+    if (ret == 0) memcpy(buf, data, len);
+
+    dma->complete();
+    dma->release();
+    return ret;
+}
+
+/* Write target memory through the diagnostic window
+   (ath10k_pci_diag_write_mem).
+
+   The roles are reversed compared to the read: the source descriptor
+   names the *host* buffer that holds the data and the destination
+   descriptor names the *target* address to write to. */
+int QCACopyEngine::diagWriteMem(u32 targetAddr, const void *buf, u32 len)
+{
+    if (!buf || !len || len > DIAG_TRANSFER_LIMIT) return -1;
+
+    IOBufferMemoryDescriptor *dma = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, kIODirectionInOut | kIOMemoryHostPhysicallyContiguous,
+        len, 0x00000000FFFFFFFFULL);
+    if (!dma) return -1;
+    if (dma->prepare() != kIOReturnSuccess) { dma->release(); return -1; }
+
+    UInt8 *data = (UInt8 *)dma->getBytesNoCopy();
+    dma_addr_t phys = dma->getPhysicalAddress();
+    if (!data || phys > 0xffffffffULL) {
+        dma->complete(); dma->release(); return -1;
+    }
+    memcpy(data, buf, len);
+    OSSynchronizeIO();
+
+    u32 ceAddr = fPci->targCpuToCeAddr(targetAddr);
+
+    int ret = diagPostDest(ceAddr);
+    if (ret == 0) ret = diagSendRaw((u32)phys, len, 0);
+    if (ret == 0) ret = diagWaitRecv(len);
+
+    dma->complete();
+    dma->release();
+    return ret;
 }
 
 int QCACopyEngine::recv(u32 pipeId, void *buf, u32 *len)

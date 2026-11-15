@@ -62,6 +62,15 @@ public:
     void dumpRegisterFingerprint(const char *tag);
     void snapshotRegisters(const char *tag);
 
+    /* PCIe link/config diagnostics. The target ROM is sensitive to the
+       PCIe state, so the link policy and the configuration space are
+       recorded at every stage of the bring-up and the link is kept out
+       of the low-power substates while the ROM boots. */
+    void applyLinkPowerPolicy();
+    void dumpPcieState(const char *tag);
+    void dumpPcieConfig(const char *tag);
+    void captureCrashState(int elapsedMs);
+
     /* Registry breadcrumbs. The driver's IOLog output never reaches the
        unified log, so every bring-up value is mirrored into ioreg. */
     void setDiagProp(const char *key, u32 value);
@@ -76,6 +85,15 @@ public:
     /* Target bring-up helpers */
     int enablePllClock();
     int configureTarget();
+
+    /* Convert a target CPU address into the address space the Copy
+       Engine understands (ath10k_pci_qca6174_targ_cpu_to_ce_addr). */
+    u32 targCpuToCeAddr(u32 addr);
+
+    /* Download the target-side Copy Engine configuration and the
+       service-to-CE map, then release the target from its early
+       configuration wait (ath10k_pci_init_config). */
+    int initConfig();
 
     /* MAC Address */
     void getMacAddress(uint8_t *mac);
@@ -116,6 +134,7 @@ private:
     bool             fFwRunning;
     bool             fTargetAwake;
     UInt8            fPcieCap;
+    UInt32           fL1PMSubstatesCap;
 };
 
 #endif /* _QCA_PCI_DEVICE_HPP_ */

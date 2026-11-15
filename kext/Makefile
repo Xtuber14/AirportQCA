@@ -92,6 +92,25 @@ BT_FW_SOURCE_DIR := ../firmware/qca
 BT_RAMPATCH := $(BT_FW_SOURCE_DIR)/rampatch_usb_00000302.bin
 BT_NVM := $(BT_FW_SOURCE_DIR)/nvm_usb_00000302.bin
 
+# All supported rampatch files (only those that exist)
+BT_RAMPATCH_0200 := $(BT_FW_SOURCE_DIR)/rampatch_usb_00000200.bin
+BT_RAMPATCH_0201 := $(BT_FW_SOURCE_DIR)/rampatch_usb_00000201.bin
+BT_RAMPATCH_0300 := $(BT_FW_SOURCE_DIR)/rampatch_usb_00000300.bin
+BT_RAMPATCH_130200 := $(BT_FW_SOURCE_DIR)/rampatch_usb_00130200.bin
+BT_RAMPATCH_130201 := $(BT_FW_SOURCE_DIR)/rampatch_usb_00130201.bin
+BT_RAMPATCH_190200 := $(BT_FW_SOURCE_DIR)/rampatch_usb_00190200.bin
+
+# All supported NVM files (only those that exist)
+BT_NVM_0200 := $(BT_FW_SOURCE_DIR)/nvm_usb_00000200.bin
+BT_NVM_0201 := $(BT_FW_SOURCE_DIR)/nvm_usb_00000201.bin
+BT_NVM_0300 := $(BT_FW_SOURCE_DIR)/nvm_usb_00000300.bin
+BT_NVM_0302 := $(BT_FW_SOURCE_DIR)/nvm_usb_00000302.bin
+BT_NVM_0302_EU := $(BT_FW_SOURCE_DIR)/nvm_usb_00000302_eu.bin
+BT_NVM_130200 := $(BT_FW_SOURCE_DIR)/nvm_usb_00130200.bin
+BT_NVM_130201 := $(BT_FW_SOURCE_DIR)/nvm_usb_00130201.bin
+BT_NVM_130201_GF := $(BT_FW_SOURCE_DIR)/nvm_usb_00130201_gf.bin
+BT_NVM_190200 := $(BT_FW_SOURCE_DIR)/nvm_usb_00190200.bin
+
 AIRPORT_KEXT := $(BUILD_DIR)/AirportQCA.kext
 BT_KEXT := $(BUILD_DIR)/QCABluetoothFirmware.kext
 
@@ -154,10 +173,24 @@ $(BUILD_DIR)/$(BT_DIR)/%.o: $(BT_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -I$(BT_DIR) -c $< -o $@
 
-$(BT_FIRMWARE_C): $(BT_RAMPATCH) $(BT_NVM)
+$(BT_FIRMWARE_C): $(BT_RAMPATCH) $(BT_NVM) $(BT_RAMPATCH_0200) $(BT_RAMPATCH_0201) $(BT_RAMPATCH_0300) $(BT_RAMPATCH_130200) $(BT_RAMPATCH_130201) $(BT_RAMPATCH_190200) $(BT_NVM_0200) $(BT_NVM_0201) $(BT_NVM_0300) $(BT_NVM_0302_EU) $(BT_NVM_130200) $(BT_NVM_130201) $(BT_NVM_130201_GF) $(BT_NVM_190200)
 	@mkdir -p $(dir $@)
 	xxd -i -n qca_rampatch_usb_00000302_bin $(BT_RAMPATCH) > $@.tmp
 	xxd -i -n qca_nvm_usb_00000302_bin $(BT_NVM) >> $@.tmp
+	xxd -i -n qca_rampatch_usb_00000200_bin $(BT_RAMPATCH_0200) >> $@.tmp
+	xxd -i -n qca_rampatch_usb_00000201_bin $(BT_RAMPATCH_0201) >> $@.tmp
+	xxd -i -n qca_rampatch_usb_00000300_bin $(BT_RAMPATCH_0300) >> $@.tmp
+	xxd -i -n qca_rampatch_usb_00130200_bin $(BT_RAMPATCH_130200) >> $@.tmp
+	xxd -i -n qca_rampatch_usb_00130201_bin $(BT_RAMPATCH_130201) >> $@.tmp
+	xxd -i -n qca_rampatch_usb_00190200_bin $(BT_RAMPATCH_190200) >> $@.tmp
+	xxd -i -n qca_nvm_usb_00000200_bin $(BT_NVM_0200) >> $@.tmp
+	xxd -i -n qca_nvm_usb_00000201_bin $(BT_NVM_0201) >> $@.tmp
+	xxd -i -n qca_nvm_usb_00000300_bin $(BT_NVM_0300) >> $@.tmp
+	xxd -i -n qca_nvm_usb_00000302_eu_bin $(BT_NVM_0302_EU) >> $@.tmp
+	xxd -i -n qca_nvm_usb_00130200_bin $(BT_NVM_130200) >> $@.tmp
+	xxd -i -n qca_nvm_usb_00130201_bin $(BT_NVM_130201) >> $@.tmp
+	xxd -i -n qca_nvm_usb_00130201_gf_bin $(BT_NVM_130201_GF) >> $@.tmp
+	xxd -i -n qca_nvm_usb_00190200_bin $(BT_NVM_190200) >> $@.tmp
 	mv $@.tmp $@
 
 $(BUILD_DIR)/$(BT_DIR)/QCAFirmwareData.o: $(BT_FIRMWARE_C)

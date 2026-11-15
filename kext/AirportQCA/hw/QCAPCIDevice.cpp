@@ -121,7 +121,8 @@ QCAPCIDevice::QCAPCIDevice()
       fHtt(nullptr),
       fFwRunning(false),
       fTargetAwake(false),
-      fPcieCap(0)
+      fPcieCap(0),
+      fL1PMSubstatesCap(0)
 {
     memset(fMacAddr, 0, sizeof(fMacAddr));
 }
@@ -187,6 +188,20 @@ bool QCAPCIDevice::init(IOPCIDevice *pciNub, AirportQCA *driver)
     } else {
         fPciNub->setProperty("QCAASPM", "no-pcie-cap");
     }
+
+    /* The endpoint advertises L1.1/L1.2 substates. If the link enters
+       one of them while the target ROM is booting, the target can wedge
+       itself long before the host gets a chance to talk to it. The
+       substates are switched off together with ASPM. */
+    IOByteCount l1ssOffset = 0;
+    if (fPciNub->extendedFindPCICapability(kIOPCIExpressCapabilityIDL1PMSubstates,
+                                           &l1ssOffset)) {
+        fL1PMSubstatesCap = (UInt32)l1ssOffset;
+        qcaSetHexProp(fPciNub, "QCAL1SSCap", fL1PMSubstatesCap);
+    }
+    applyLinkPowerPolicy();
+    dumpPcieState("Pre");
+    dumpPcieConfig("Pre");
 
     /* Initialize Copy Engine */
     fPciNub->setProperty("QCAStartStage", "hal-ce");
@@ -269,11 +284,18 @@ int QCAPCIDevice::warmReset()
     val = read32(RTC_SOC_BASE_ADDRESS + SOC_RESET_CONTROL_ADDRESS);
     write32(RTC_SOC_BASE_ADDRESS + SOC_RESET_CONTROL_ADDRESS,
             val | SOC_RESET_CONTROL_CPU_WARM_RST_MASK);
+    /* Read the register back: if the write does not stick the warm
+       reset never happened and the target keeps running the code that
+       just crashed. */
+    qcaSetHexProp(fPciNub, "QCAWarmRstCtl", read32(RTC_SOC_BASE_ADDRESS + SOC_RESET_CONTROL_ADDRESS));
 
     /* ath10k_pci_init_pipes: reprogram the CE hardware. */
     fCopyEngine->startPipes();
 
-    if (waitForTargetInit(1000) != 0) return -1;
+    /* ath10k ignores the result of this wait: the CE reset and the
+       second CPU reset that follow are what actually revive the target,
+       so bailing out here would skip half of the sequence. */
+    waitForTargetInit(1000);
 
     /* ath10k_pci_warm_reset_clear_lf: disable the LF timer. */
     val = read32(RTC_SOC_BASE_ADDRESS + SOC_LF_TIMER_CONTROL0_ADDRESS);
@@ -293,6 +315,7 @@ int QCAPCIDevice::warmReset()
     val = read32(RTC_SOC_BASE_ADDRESS + SOC_RESET_CONTROL_ADDRESS);
     write32(RTC_SOC_BASE_ADDRESS + SOC_RESET_CONTROL_ADDRESS,
             val | SOC_RESET_CONTROL_CPU_WARM_RST_MASK);
+    qcaSetHexProp(fPciNub, "QCAWarmRstCtl2", read32(RTC_SOC_BASE_ADDRESS + SOC_RESET_CONTROL_ADDRESS));
 
     fCopyEngine->startPipes();
 
@@ -330,6 +353,12 @@ int QCAPCIDevice::chipReset()
     qcaSetHexProp(fPciNub, "QCAFWIndPostReset", read32(FW_INDICATOR_ADDRESS));
     dumpRegisterFingerprint("Post");
     snapshotRegisters("Rst");
+
+    /* The cold reset also resets the PCIe core: re-apply the link
+       policy and record the resulting link state. */
+    applyLinkPowerPolicy();
+    dumpPcieState("Rst");
+    dumpPcieConfig("Rst");
     return 0;
 }
 
@@ -346,6 +375,10 @@ int QCAPCIDevice::waitForTargetInit(int timeoutMs)
     unsigned snapshotCount = sizeof(snapshotAt) / sizeof(snapshotAt[0]);
     unsigned snapshotIdx = 0;
     int elapsed = 0;
+    /* The target reports a crash within a few milliseconds of the reset,
+       so the indicator is polled at 1 ms to pin down the exact moment
+       the target died. */
+    int lastNonZero = -1;
 
     while (timeoutMs > 0) {
         /* Keep the SoC awake while polling: re-validate the RTC state
@@ -368,10 +401,14 @@ int QCAPCIDevice::waitForTargetInit(int timeoutMs)
                "target initialized"; the alternate register is sampled
                for diagnostics only. */
             if (i != 0) continue;
+            if (val) lastNonZero = elapsed;
             if (val & FW_IND_EVENT_PENDING) {
                 qcaSetHexProp(fPciNub, "QCAFwIndLast", val);
                 qcaSetHexProp(fPciNub, "QCAFwIndPolls", totalCount);
-                qca_err("Target reported firmware crash during init (0x%08x)", val);
+                qcaSetHexProp(fPciNub, "QCAFwIndFirst0", first[0]);
+                qca_err("Target reported firmware crash during init (0x%08x) after %d ms",
+                        val, elapsed);
+                captureCrashState(elapsed);
                 return -1;
             }
             if (val & FW_IND_INITIALIZED) {
@@ -386,15 +423,15 @@ int QCAPCIDevice::waitForTargetInit(int timeoutMs)
 
         haveFirst = true;
         totalCount++;
-        elapsed += 10;
+        elapsed += 1;
         if (snapshotIdx < snapshotCount && elapsed >= snapshotAt[snapshotIdx]) {
             char tag[16];
             snprintf(tag, sizeof(tag), "T%d", snapshotAt[snapshotIdx]);
             snapshotRegisters(tag);
             snapshotIdx++;
         }
-        qca_mdelay(10);
-        timeoutMs -= 10;
+        qca_mdelay(1);
+        timeoutMs -= 1;
     }
 
     for (unsigned i = 0; i < FW_IND_CANDIDATE_COUNT; i++) {
@@ -406,6 +443,7 @@ int QCAPCIDevice::waitForTargetInit(int timeoutMs)
     }
     qcaSetHexProp(fPciNub, "QCAFwIndOnes", onesCount);
     qcaSetHexProp(fPciNub, "QCAFwIndPolls", totalCount);
+    qcaSetHexProp(fPciNub, "QCAFwIndLastNz", (u32)lastNonZero);
     qca_err("Timed out waiting for target initialization");
     return -1;
 }
@@ -467,6 +505,97 @@ void QCAPCIDevice::dumpRegisterFingerprint(const char *tag)
         snprintf(key, sizeof(key), "QCAReg%s%05x", tag, kRegFingerprint[i]);
         qcaSetHexProp(fPciNub, key, val);
     }
+}
+
+/* Keep the PCIe link out of the low-power substates while the target
+   ROM boots. ath10k clears ASPM in hif_power_up for the same reason and
+   never lets the link enter L1 while the target is being reset and
+   polled. macOS' PCI stack enables ASPM L1 on this device by default
+   (link control bit 1 was set before the driver touched it) and the
+   endpoint additionally advertises L1.1/L1.2 substates. */
+void QCAPCIDevice::applyLinkPowerPolicy()
+{
+    if (!fPcieCap) return;
+
+    UInt16 linkCtl = fPciNub->configRead16(fPcieCap + 0x10);
+    if (linkCtl & 0x0003) {
+        linkCtl = (UInt16)(linkCtl & ~0x0003);
+        fPciNub->configWrite16(fPcieCap + 0x10, linkCtl);
+    }
+
+    if (fL1PMSubstatesCap) {
+        /* L1 PM Substates Control: bit 0 enables the substates. */
+        UInt8 ctlOffset = (UInt8)(fL1PMSubstatesCap + 4);
+        UInt32 ctl = fPciNub->configRead32(ctlOffset);
+        if (ctl & 0x1) {
+            ctl &= ~0x1u;
+            fPciNub->configWrite32(ctlOffset, ctl);
+        }
+        qcaSetHexProp(fPciNub, "QCAL1SSCtl", fPciNub->configRead32(ctlOffset));
+    }
+}
+
+/* PCIe capability state: link and device control/status registers. A
+   link that drops into a low-power substate (or that reports a speed
+   or width downgrade) explains a target that starts and then dies. */
+void QCAPCIDevice::dumpPcieState(const char *tag)
+{
+    if (!fPcieCap) return;
+    char key[40];
+
+    u16 linkCtl  = fPciNub->configRead16(fPcieCap + 0x10);
+    u16 linkSta  = fPciNub->configRead16(fPcieCap + 0x12);
+    u16 devCtl   = fPciNub->configRead16(fPcieCap + 0x08);
+    u16 devSta   = fPciNub->configRead16(fPcieCap + 0x0a);
+    u16 linkCtl2 = fPciNub->configRead16(fPcieCap + 0x30);
+
+    snprintf(key, sizeof(key), "QCA%sLinkCtl", tag);
+    qcaSetHexProp(fPciNub, key, linkCtl);
+    snprintf(key, sizeof(key), "QCA%sLinkSta", tag);
+    qcaSetHexProp(fPciNub, key, linkSta);
+    snprintf(key, sizeof(key), "QCA%sDevCtl", tag);
+    qcaSetHexProp(fPciNub, key, devCtl);
+    snprintf(key, sizeof(key), "QCA%sDevSta", tag);
+    qcaSetHexProp(fPciNub, key, devSta);
+    snprintf(key, sizeof(key), "QCA%sLinkCtl2", tag);
+    qcaSetHexProp(fPciNub, key, linkCtl2);
+}
+
+/* Full 256 byte dump of the standard configuration space. The values
+   can be compared against a Linux boot of the same machine, which is
+   the quickest way to spot a power-management or MSI difference
+   between the two stacks. */
+void QCAPCIDevice::dumpPcieConfig(const char *tag)
+{
+    char key[40];
+    char buf[48];
+
+    for (unsigned row = 0; row < 16; row++) {
+        UInt32 d0 = fPciNub->configRead32((UInt8)(row * 16));
+        UInt32 d1 = fPciNub->configRead32((UInt8)(row * 16 + 4));
+        UInt32 d2 = fPciNub->configRead32((UInt8)(row * 16 + 8));
+        UInt32 d3 = fPciNub->configRead32((UInt8)(row * 16 + 12));
+        snprintf(buf, sizeof(buf), "%08x %08x %08x %08x", d0, d1, d2, d3);
+        snprintf(key, sizeof(key), "QCAcfg%s%02x", tag, row * 16);
+        fPciNub->setProperty(key, buf);
+    }
+}
+
+/* Everything that is known about the target at the moment it reports a
+   crash: the firmware indicator, the SoC registers, the PCIe link and
+   the configuration space. */
+void QCAPCIDevice::captureCrashState(int elapsedMs)
+{
+    qcaSetHexProp(fPciNub, "QCACrashMs", (u32)elapsedMs);
+    qcaSetHexProp(fPciNub, "QCACrashInd", read32(FW_INDICATOR_ADDRESS));
+    qcaSetHexProp(fPciNub, "QCACrashCtrl", read32(SOC_CORE_BASE_ADDRESS + CORE_CTRL_ADDRESS));
+    qcaSetHexProp(fPciNub, "QCACrashIntrEn", read32(SOC_CORE_BASE_ADDRESS + PCIE_INTR_ENABLE_ADDRESS));
+    qcaSetHexProp(fPciNub, "QCACrashIntrCause", read32(SOC_CORE_BASE_ADDRESS + PCIE_INTR_CAUSE_ADDRESS));
+    qcaSetHexProp(fPciNub, "QCACrashScratch", read32(RTC_SOC_BASE_ADDRESS + SCRATCH_3_ADDRESS));
+    qcaSetHexProp(fPciNub, "QCACrashResetCtl", read32(RTC_SOC_BASE_ADDRESS + SOC_RESET_CONTROL_ADDRESS));
+    snapshotRegisters("Crash");
+    dumpPcieState("Crash");
+    dumpPcieConfig("Crash");
 }
 
 int QCAPCIDevice::enablePllClock()
