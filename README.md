@@ -32,13 +32,14 @@ This project delivers two kernel extensions that work together to bring **native
 - **Power management** — Full D0/D3 transitions, sleep/wake recovery
 
 ### Bluetooth (QCABluetoothFirmware)
-- **ROM version detection** — Identifies QCA Rome `0x00000302` (QCA9377)
-- **Rampatch + NVM upload** — `rampatch_usb_00000302.bin` + `nvm_usb_00000302.bin`
+- **Multi-chip support** — 10 QCA Bluetooth variants: Rome 1.0/1.1/2.0/2.1/3.0/3.2, WCN6855 1.0/2.0/2.1, WCN785x 2.0
+- **ROM version detection** — Identifies all QCA Rome/WCN variants via `QCA_GET_TARGET_VERSION`
+- **Rampatch + NVM upload** — Per-chip firmware files (21 rampatch + 58 NVM files bundled)
 - **Linux-parity firmware logic** — Full TLV tag patching (HCI, Deep Sleep, BD_ADDR), rampatch version verification, recovery-friendly equal-version allowance
 - **Board-ID based NVM loading** — Extracts board_id from controller (MULTI_NVM flag), generates `nvm_usb_XXXXXXXX_YYYY.bin` filenames for board-specific configurations
 - **Suspend/resume support** — Power management registration (`PMinit`), `setPowerState()` for D3→D0 wake, automatic firmware re-upload if lost during sleep
 - **Correct battery reporting** — NVM patch clears erroneous "charging" flag (bit 6) while preserving in-band sleep (bit 7)
-- **Multi-OEM support** — 100+ USB VID/PID entries for Qualcomm, Foxconn, Lite-On, AzureWave, ASUS, and other OEMs
+- **Qualcomm-only vendor IDs** — Info.plist contains only 10 Qualcomm Atheros VID 0x0CF3 entries (OEM firmware bundled for manual matching)
 - **Clean handoff** — Renames device to `"Bluetooth USB Host Controller"` for native `IOBluetoothFamily` matching on macOS 12+
 
 ---
@@ -47,19 +48,25 @@ This project delivers two kernel extensions that work together to bring **native
 
 | Chipset | Wi-Fi | Bluetooth | PCIe ID | USB ID |
 |---------|-------|-----------|---------|--------|
-| **QCA9377** | 1×1 802.11ac (433 Mbps) | BT 4.2 / 5.0 | `168C:0042` | `0CF3:E300` + OEM variants |
+| **QCA9377** (Rome 3.2) | 1×1 802.11ac (433 Mbps) | BT 4.2 / 5.0 | `168C:0042` | `0CF3:E300` |
+| **Rome 1.0/1.1** | — | BT 4.0/4.1 | — | `0CF3:E007`, `E009` |
+| **Rome 2.0/2.1** | — | BT 4.1 | — | `0CF3:E010`, `E360` |
+| **Rome 3.0** | — | BT 4.2 | — | `0CF3:E301` |
+| **WCN6855 1.0/2.0/2.1** | — | BT 5.0 | — | `0CF3:E600` |
+| **WCN785x 2.0** | — | BT 5.0 | — | `0CF3:E700` |
 
 ### Bluetooth USB IDs (Qualcomm Atheros 0x0CF3)
 `E300`, `535B`, `E007`, `E009`, `E010`, `E301`, `E360`, `E500`, `E600`, `E700`
 
-### OEM Variants
-| Vendor | VID | Example PIDs |
-|--------|-----|--------------|
-| **Foxconn / Hon Hai** | 0x0489 | E0A2, E092, E09F, E0C7–E0EC, E0FC, E100–E14D |
-| **Lite-On** | 0x04CA | 3011, 3015, 3016, 301A, 3021–3024, 3A22–3A27 |
-| **AzureWave** | 0x13D3 | 3491, 3496, 3501, 3503, 3587, 3601–3624 |
-| **ASUS** | 0x0B05 | 1825, 1868 |
-| **Other** | 0x10AB, 0x28DE, 0x2C7C, 0x35F5 | Various |
+### OEM Firmware (Bundled, for Manual Matching)
+All 79 firmware files for OEM variants are bundled in `firmware/qca/`:
+- **Rome 1.0/1.1**: `rampatch/nvm_usb_00000100/101.bin`
+- **Rome 2.0/2.1**: `rampatch/nvm_usb_00000200/201.bin`
+- **Rome 3.0/3.2**: `rampatch/nvm_usb_00000300/302.bin` (+ EU variant)
+- **WCN6855 1.0/2.0/2.1**: `rampatch/nvm_usb_00130200/201.bin` + 12 board-specific
+- **WCN6855 GF**: `nvm_usb_00130201_gf.bin` + board-specific
+- **WCN785x 2.0**: `rampatch/nvm_usb_00190200.bin` + 12 board-specific
+- **Subdirs**: `QCA2066/`, `QCA6698/`, `QCC2072/`
 
 Tested on: Acer laptop with QCA9377.
 
