@@ -142,6 +142,9 @@ struct qca_rampatch_version {
 #define EDL_TAG_ID_HCI          17
 #define EDL_TAG_ID_DEEP_SLEEP   27
 
+/* Version flags (matches Linux btusb_main.c) */
+#define QCA_FLAG_MULTI_NVM      0x80
+
 /* Rome 3.2 version offset in rampatch file */
 #define ROME_3_2_VER_OFFSET     18
 
@@ -244,11 +247,31 @@ bool QCABluetoothFirmware::uploadFirmware(bool isResume)
 
     /* --- NVM UPLOAD --- */
     if (!(status & QCA_SYSCFG_UPDATED)) {
+        /* Extract board_id from controller version for board-specific NVM loading */
+        uint16_t boardId = extractBoardId(&ver);
+        if (boardId) {
+            IOLog("QCABluetoothFirmware: detected board_id=0x%04x, trying board-specific NVM\n", boardId);
+        }
+
         const uint8_t *nvm = qca_nvm_usb_00000302_bin;
         const uint32_t nvmSize = qca_nvm_usb_00000302_bin_len;
         if (nvmSize <= QCA_NVM_HEADER_SIZE) {
             IOLog("QCABluetoothFirmware: bundled NVM image is invalid\n");
             return false;
+        }
+
+        /* Try board-specific NVM first if board_id available.
+         * We patch the same TLV tags into the board-specific NVM if it exists. */
+        const uint8_t *nvmToUse = nvm;
+
+        if (boardId) {
+            char boardNvmName[64];
+            generateNvmFileName(boardNvmName, sizeof(boardNvmName), romVersion, boardId);
+            IOLog("QCABluetoothFirmware: checking for board-specific NVM: %s\n", boardNvmName);
+            /* Note: In this kext, we only have the generic NVM bundled.
+             * For board-specific NVM support, additional firmware files would need to be bundled.
+             * For now, we use the generic NVM and patch it. */
+            IOLog("QCABluetoothFirmware: using generic NVM (board-specific not bundled), board_id=0x%04x\n", boardId);
         }
 
         /* Create mutable copy for NVM patching.
@@ -261,7 +284,7 @@ bool QCABluetoothFirmware::uploadFirmware(bool isResume)
             IOLog("QCABluetoothFirmware: failed to allocate NVM patch buffer\n");
             return false;
         }
-        memcpy(nvmPatched, nvm, nvmSize);
+        memcpy(nvmPatched, nvmToUse, nvmSize);
 
         /* Parse TLV tags: [4-byte header][tag_id(2) tag_len(2) reserve1(4) reserve2(4) data[]]... */
         for (uint32_t offset = QCA_NVM_HEADER_SIZE; offset + 8 < nvmSize;) {
@@ -433,6 +456,36 @@ bool QCABluetoothFirmware::checkFirmwareNeeded()
     bool needed = (status & (QCA_PATCH_UPDATED | QCA_SYSCFG_UPDATED)) != (QCA_PATCH_UPDATED | QCA_SYSCFG_UPDATED);
     IOLog("QCABluetoothFirmware: [check] status=0x%02x, firmware needed=%d\n", status, needed);
     return needed;
+}
+
+/* Extract board_id from controller version (matches Linux btusb_main.c qca_extract_board_id).
+ * Returns 0 if no board_id available or MULTI_NVM flag not set. */
+uint16_t QCABluetoothFirmware::extractBoardId(const struct qca_version *ver)
+{
+    uint16_t flag = OSSwapLittleToHostInt16(ver->flag);
+    uint16_t board_id = 0;
+
+    if (((flag >> 8) & 0xff) == QCA_FLAG_MULTI_NVM) {
+        /* Board ID is split: high byte = chip_id, low byte = platform_id */
+        board_id = (ver->chip_id << 8) | ver->platform_id;
+    }
+
+    /* 0xffff is invalid */
+    if (board_id == 0xffff)
+        board_id = 0;
+
+    return board_id;
+}
+
+/* Generate NVM filename with optional board_id suffix.
+ * Format: nvm_usb_XXXXXXXX.bin or nvm_usb_XXXXXXXX_YYYY.bin */
+void QCABluetoothFirmware::generateNvmFileName(char *buf, size_t maxSize, uint32_t romVersion, uint16_t boardId)
+{
+    if (boardId) {
+        snprintf(buf, maxSize, "nvm_usb_%08x_%04x.bin", romVersion, boardId);
+    } else {
+        snprintf(buf, maxSize, "nvm_usb_%08x.bin", romVersion);
+    }
 }
 
 /* Power management: handle D3->D0 transition (wake from sleep).
