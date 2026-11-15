@@ -35,6 +35,7 @@ This project delivers two kernel extensions that work together to bring **native
 - **ROM version detection** — Identifies QCA Rome `0x00000302` (QCA9377)
 - **Rampatch + NVM upload** — `rampatch_usb_00000302.bin` + `nvm_usb_00000302.bin`
 - **Linux-parity firmware logic** — Full TLV tag patching (HCI, Deep Sleep, BD_ADDR), rampatch version verification, recovery-friendly equal-version allowance
+- **Board-ID based NVM loading** — Extracts board_id from controller (MULTI_NVM flag), generates `nvm_usb_XXXXXXXX_YYYY.bin` filenames for board-specific configurations
 - **Suspend/resume support** — Power management registration (`PMinit`), `setPowerState()` for D3→D0 wake, automatic firmware re-upload if lost during sleep
 - **Correct battery reporting** — NVM patch clears erroneous "charging" flag (bit 6) while preserving in-band sleep (bit 7)
 - **Multi-OEM support** — 100+ USB VID/PID entries for Qualcomm, Foxconn, Lite-On, AzureWave, ASUS, and other OEMs
