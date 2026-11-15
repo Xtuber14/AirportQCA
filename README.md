@@ -58,8 +58,20 @@ This project delivers two kernel extensions that work together to bring **native
 ### Bluetooth USB IDs (Qualcomm Atheros 0x0CF3)
 `E300`, `535B`, `E007`, `E009`, `E010`, `E301`, `E360`, `E500`, `E600`, `E700`
 
-### OEM Firmware (Bundled, for Manual Matching)
-All 79 firmware files for OEM variants are bundled in `firmware/qca/`:
+### OEM Vendor IDs (Auto-Matched via Info.plist)
+Info.plist includes 26 Qualcomm + OEM vendor IDs for auto-matching:
+
+| Vendor | VID | Example PIDs |
+|--------|-----|--------------|
+| **Qualcomm Atheros** | 0x0CF3 | E300, 535B, E007, E009, E010, E301, E360, E500, E600, E700 |
+| **Lite-On Technology** | 0x04CA | 3011, 3015, 3016, 301A, 3021 |
+| **Foxconn / Hon Hai** | 0x0489 | E0A2, E092, E09F |
+| **AzureWave** | 0x13D3 | 3491, 3496, 3501, 3503 |
+| **ASUS** | 0x0B05 | 1825, 1868 |
+| **Other** | 0x10AB | 9108, 9109 |
+
+### OEM Firmware (Bundled, for Board-Specific Variants)
+All 79 firmware files for OEM/board-specific variants are bundled in `firmware/qca/`:
 - **Rome 1.0/1.1**: `rampatch/nvm_usb_00000100/101.bin`
 - **Rome 2.0/2.1**: `rampatch/nvm_usb_00000200/201.bin`
 - **Rome 3.0/3.2**: `rampatch/nvm_usb_00000300/302.bin` (+ EU variant)
@@ -68,7 +80,7 @@ All 79 firmware files for OEM variants are bundled in `firmware/qca/`:
 - **WCN785x 2.0**: `rampatch/nvm_usb_00190200.bin` + 12 board-specific
 - **Subdirs**: `QCA2066/`, `QCA6698/`, `QCC2072/`
 
-Tested on: Acer laptop with QCA9377.
+Tested on: Acer laptop with QCA9377 (Lite-On 0x04CA:0x3015).
 
 ---
 
