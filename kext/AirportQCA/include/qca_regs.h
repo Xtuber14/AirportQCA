@@ -246,11 +246,36 @@ static inline int _qcaLsb(u32 mask)
 #define QCA9377_IRAM_BANKS                  9
 
 /* struct pcie_state (ath10k pci.h): the target hands the host the
-   addresses of the pipe configuration and of the service-to-pipe map. */
+   addresses of the pipe configuration and of the service-to-pipe map.
+   The structure also carries the MSI handshake (how many message
+   signalled interrupts the target asks for, how many the host granted
+   and the message address/data the target expects) plus the PCIe power
+   management method. The host only ever looks at the first two fields
+   in ath10k, but the remaining fields are the target's view of the
+   PCIe setup and are dumped for diagnostics: a target that waits for
+   an MSI grant never leaves the boot loader. */
 #define PCIE_STATE_PIPE_CFG_ADDR_OFFSET     0x00000000
 #define PCIE_STATE_SVC_TO_PIPE_MAP_OFFSET   0x00000004
+#define PCIE_STATE_MSI_REQUESTED_OFFSET     0x00000008
+#define PCIE_STATE_MSI_GRANTED_OFFSET      0x0000000C
+#define PCIE_STATE_MSI_ADDR_OFFSET          0x00000010
+#define PCIE_STATE_MSI_DATA_OFFSET          0x00000014
+#define PCIE_STATE_MSI_FW_INTR_DATA_OFFSET  0x00000018
+#define PCIE_STATE_POWER_MGMT_METHOD_OFFSET 0x0000001C
 #define PCIE_STATE_CONFIG_FLAGS_OFFSET      0x00000020
+#define PCIE_STATE_WORD_COUNT               9
 #define PCIE_CONFIG_FLAG_ENABLE_L1          0x00000001
+
+/* Standard PCI capability ids used by the configuration-space dumper. */
+#define PCI_CAP_ID_PM                        0x01
+#define PCI_CAP_ID_MSI                       0x05
+#define PCI_CAP_ID_PCIE                      0x10
+
+/* PCIe Device Control register (capability + 0x08). Bit 13 disables the
+   legacy INTx interrupt line; the endpoint advertises MSI but macOS
+   never programs the MSI capability, so the device is left without any
+   way to raise an interrupt. */
+#define PCI_EXP_DEVCTL_DISABLE_INTX         0x2000
 
 /* Pipe directions (ath10k ce.h). The directions are relative to the
    host, so PIPEDIR_OUT means host -> target. */

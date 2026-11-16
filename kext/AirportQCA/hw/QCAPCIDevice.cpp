@@ -33,6 +33,23 @@ static void qcaSetHexProp(IOPCIDevice *nub, const char *key, u32 value)
     nub->setProperty(key, buf);
 }
 
+/* Insert the experiment tag behind the "QCA" prefix of a diagnostic
+   property name, so that a single boot can run several reset
+   experiments without one overwriting the results of the other. */
+static void qcaTaggedKey(char *out, size_t outLen, const char *key, const char *tag)
+{
+    if (!out || !outLen) return;
+    out[0] = '\0';
+    if (!key) return;
+
+    if (tag && tag[0]) {
+        const char *rest = (strncmp(key, "QCA", 3) == 0) ? key + 3 : key;
+        snprintf(out, outLen, "QCA%s%s", tag, rest);
+    } else {
+        snprintf(out, outLen, "%s", key);
+    }
+}
+
 /* The authoritative firmware indicator is the one ath10k uses for the
    QCA9377 (qca6174_regs.fw_indicator_address = 0x3a028). A second
    candidate used to be sampled at 0x180c; that address is not part of
@@ -154,6 +171,7 @@ QCAPCIDevice::QCAPCIDevice()
       fL1PMSubstatesCap(0)
 {
     memset(fMacAddr, 0, sizeof(fMacAddr));
+    fDiagTag[0] = '\0';
 }
 
 QCAPCIDevice::~QCAPCIDevice()
@@ -193,9 +211,9 @@ bool QCAPCIDevice::init(IOPCIDevice *pciNub, AirportQCA *driver)
     /* MMIO liveness probes (values become ioreg properties): the SoC
        chip id and the firmware indicator before any reset. */
     u32 chipId = read32(RTC_SOC_BASE_ADDRESS + SOC_CHIP_ID_ADDRESS);
-    qcaSetHexProp(fPciNub, "QCAChipId", chipId);
+    setDiagProp("QCAChipId", chipId);
     u32 fwIndInit = read32(FW_INDICATOR_ADDRESS);
-    qcaSetHexProp(fPciNub, "QCAFWIndInit", fwIndInit);
+    setDiagProp("QCAFWIndInit", fwIndInit);
     dumpRegisterFingerprint("Pre");
 
     /* Disable ASPM before any target reset — ath10k clears
@@ -207,7 +225,7 @@ bool QCAPCIDevice::init(IOPCIDevice *pciNub, AirportQCA *driver)
     fPcieCap = pcieCap;
     if (pcieCap) {
         UInt16 linkCtl = fPciNub->configRead16(pcieCap + 0x10);
-        qcaSetHexProp(fPciNub, "QCALinkCtl", linkCtl);
+        setDiagProp("QCALinkCtl", linkCtl);
         if (linkCtl & 0x3) {
             fPciNub->configWrite16(pcieCap + 0x10, (UInt16)(linkCtl & ~0x3));
             fPciNub->setProperty("QCAASPM", "disabled");
@@ -226,7 +244,7 @@ bool QCAPCIDevice::init(IOPCIDevice *pciNub, AirportQCA *driver)
     if (fPciNub->extendedFindPCICapability(kIOPCIExpressCapabilityIDL1PMSubstates,
                                            &l1ssOffset)) {
         fL1PMSubstatesCap = (UInt32)l1ssOffset;
-        qcaSetHexProp(fPciNub, "QCAL1SSCap", fL1PMSubstatesCap);
+        setDiagProp("QCAL1SSCap", fL1PMSubstatesCap);
     }
     applyLinkPowerPolicy();
     dumpPcieState("Pre");
@@ -256,42 +274,32 @@ bool QCAPCIDevice::init(IOPCIDevice *pciNub, AirportQCA *driver)
     return true;
 }
 
-bool QCAPCIDevice::wakeTarget()
+/* Strong force-wake (mirrors ath10k_pci_force_wake): always assert SOC_WAKE
+   and wait for RTC ON, regardless of current state. Call this before any
+   target reset to ensure the SoC is fully powered. */
+bool QCAPCIDevice::forceWake()
 {
-    /* ath10k __ath10k_pci_wake + ath10k_pci_wake_wait: assert the SoC
-       wake bit in the PCIe local register block and wait until the RTC
-       state register reports ON. While the SoC sleeps its register file
-       is unpowered, so reads return zero and the ROM never runs.
-
-       ath10k only writes the wake register when the SoC really is
-       asleep, and the QCA6174 is known to misbehave when SOC_WAKE is
-       poked too often (ath10k pci.h). The RTC state register lives in
-       the host side register block, so it can be read without waking
-       the SoC first: check it and only write the wake bit when the SoC
-       is actually off. */
-    if (fTargetAwake) return true;
-    if (!fMmioBase) return false;
-
-    u32 state = read32Raw(PCIE_LOCAL_BASE_ADDRESS + RTC_STATE_ADDRESS);
-    if ((state & RTC_STATE_V_MASK) != RTC_STATE_V_ON) {
-        write32Raw(PCIE_LOCAL_BASE_ADDRESS + PCIE_SOC_WAKE_ADDRESS, PCIE_SOC_WAKE_V_MASK);
-        for (int i = 0; i < 100; i++) {
-            state = read32Raw(PCIE_LOCAL_BASE_ADDRESS + RTC_STATE_ADDRESS);
-            if ((state & RTC_STATE_V_MASK) == RTC_STATE_V_ON) break;
-            qca_mdelay(1);
+    qca_info("Force-waking target SoC");
+    write32Raw(PCIE_LOCAL_BASE_ADDRESS + PCIE_SOC_WAKE_ADDRESS, PCIE_SOC_WAKE_V_MASK);
+    for (int i = 0; i < 100; i++) {
+        u32 state = read32Raw(PCIE_LOCAL_BASE_ADDRESS + RTC_STATE_ADDRESS);
+        if ((state & RTC_STATE_V_MASK) == RTC_STATE_V_ON) {
+            setDiagProp("QCAWakeState", state);
+            return true;
         }
+        qca_mdelay(1);
     }
-
-    if ((state & RTC_STATE_V_MASK) == RTC_STATE_V_ON) {
-        fTargetAwake = true;
-        qcaSetHexProp(fPciNub, "QCAWakeState", state);
-        return true;
-    }
-
-    qcaSetHexProp(fPciNub, "QCAWakeState", state);
-    fPciNub->setProperty("QCAWakeFail", true);
+    u32 state = read32Raw(PCIE_LOCAL_BASE_ADDRESS + RTC_STATE_ADDRESS);
+    setDiagProp("QCAWakeState", state);
     qca_err("Target SoC did not wake (RTC state 0x%08x)", state);
     return false;
+}
+
+/* Legacy wakeTarget: now just calls forceWake for ABI compatibility.
+   The read32/write32 inline functions still call this. */
+bool QCAPCIDevice::wakeTarget()
+{
+    return forceWake();
 }
 
 void QCAPCIDevice::markTargetAsleep()
@@ -327,7 +335,7 @@ int QCAPCIDevice::warmReset()
     /* Read the register back: if the write does not stick the warm
        reset never happened and the target keeps running the code that
        just crashed. */
-    qcaSetHexProp(fPciNub, "QCAWarmRstCtl", read32(RTC_SOC_BASE_ADDRESS + SOC_RESET_CONTROL_ADDRESS));
+    setDiagProp("QCAWarmRstCtl", read32(RTC_SOC_BASE_ADDRESS + SOC_RESET_CONTROL_ADDRESS));
 
     /* ath10k_pci_init_pipes: reprogram the CE hardware. */
     fCopyEngine->startPipes();
@@ -355,7 +363,7 @@ int QCAPCIDevice::warmReset()
     val = read32(RTC_SOC_BASE_ADDRESS + SOC_RESET_CONTROL_ADDRESS);
     write32(RTC_SOC_BASE_ADDRESS + SOC_RESET_CONTROL_ADDRESS,
             val | SOC_RESET_CONTROL_CPU_WARM_RST_MASK);
-    qcaSetHexProp(fPciNub, "QCAWarmRstCtl2", read32(RTC_SOC_BASE_ADDRESS + SOC_RESET_CONTROL_ADDRESS));
+    setDiagProp("QCAWarmRstCtl2", read32(RTC_SOC_BASE_ADDRESS + SOC_RESET_CONTROL_ADDRESS));
 
     fCopyEngine->startPipes();
 
@@ -370,7 +378,7 @@ int QCAPCIDevice::chipReset()
        the SoC in reset forever and the ROM bootloader never runs. */
     qca_info("Executing SoC cold reset");
     u32 val = read32(PCIE_LOCAL_BASE_ADDRESS + SOC_GLOBAL_RESET_ADDRESS);
-    qcaSetHexProp(fPciNub, "QCADeviceResetReg", val);
+    setDiagProp("QCADeviceResetReg", val);
     val |= 1;
     write32(PCIE_LOCAL_BASE_ADDRESS + SOC_GLOBAL_RESET_ADDRESS, val);
     qca_mdelay(20);
@@ -390,7 +398,7 @@ int QCAPCIDevice::chipReset()
     fPciNub->setProperty("QCADecodeReassert", true);
 
     /* Post-reset liveness probe. */
-    qcaSetHexProp(fPciNub, "QCAFWIndPostReset", read32(FW_INDICATOR_ADDRESS));
+    setDiagProp("QCAFWIndPostReset", read32(FW_INDICATOR_ADDRESS));
     dumpRegisterFingerprint("Post");
     snapshotRegisters("Rst");
 
@@ -440,8 +448,10 @@ int QCAPCIDevice::waitForTargetInit(int timeoutMs)
            and re-wake if the target dropped back to sleep. */
         u32 rtc = read32Raw(PCIE_LOCAL_BASE_ADDRESS + RTC_STATE_ADDRESS);
         if ((rtc & RTC_STATE_V_MASK) != RTC_STATE_V_ON) {
-            markTargetAsleep();
-            wakeTarget();
+            if (!forceWake()) {
+                qca_err("Failed to re-wake target during polling");
+                return -1;
+            }
         }
 
         for (unsigned i = 0; i < FW_IND_CANDIDATE_COUNT; i++) {
@@ -474,9 +484,9 @@ int QCAPCIDevice::waitForTargetInit(int timeoutMs)
                 if (!crashSeen) {
                     crashSeen = true;
                     crashGraceMs = FW_IND_CRASH_GRACE_MS;
-                    qcaSetHexProp(fPciNub, "QCAFwIndLast", val);
-                    qcaSetHexProp(fPciNub, "QCAFwIndPolls", totalCount);
-                    qcaSetHexProp(fPciNub, "QCAFwIndFirst0", first[0]);
+                    setDiagProp("QCAFwIndLast", val);
+                    setDiagProp("QCAFwIndPolls", totalCount);
+                    setDiagProp("QCAFwIndFirst0", first[0]);
                     qca_err("Target reported a firmware event (0x%08x) after %d ms",
                             val, elapsed);
                     captureCrashState(elapsed);
@@ -489,7 +499,7 @@ int QCAPCIDevice::waitForTargetInit(int timeoutMs)
             if (val & FW_IND_INITIALIZED) {
                 char key[32];
                 snprintf(key, sizeof(key), "QCAFwIndHit%u", i);
-                qcaSetHexProp(fPciNub, key, kFwIndicatorCandidates[i]);
+                setDiagProp(key, kFwIndicatorCandidates[i]);
                 qca_info("Target initialized successfully (indicator %u = 0x%08x)",
                          i, val);
                 recordIndicatorSequence(seqValue, seqMs, seqCount);
@@ -517,14 +527,14 @@ int QCAPCIDevice::waitForTargetInit(int timeoutMs)
     for (unsigned i = 0; i < FW_IND_CANDIDATE_COUNT; i++) {
         char key[32];
         snprintf(key, sizeof(key), "QCAFwIndFirst%u", i);
-        qcaSetHexProp(fPciNub, key, first[i]);
+        setDiagProp(key, first[i]);
         snprintf(key, sizeof(key), "QCAFwIndLast%u", i);
-        qcaSetHexProp(fPciNub, key, last[i]);
+        setDiagProp(key, last[i]);
     }
-    qcaSetHexProp(fPciNub, "QCAFwIndOnes", onesCount);
-    qcaSetHexProp(fPciNub, "QCAFwIndPolls", totalCount);
-    qcaSetHexProp(fPciNub, "QCAFwIndLastNz", (u32)lastNonZero);
-    qcaSetHexProp(fPciNub, "QCAFwIndCrash", (u32)(crashSeen ? 1 : 0));
+    setDiagProp("QCAFwIndOnes", onesCount);
+    setDiagProp("QCAFwIndPolls", totalCount);
+    setDiagProp("QCAFwIndLastNz", (u32)lastNonZero);
+    setDiagProp("QCAFwIndCrash", (u32)(crashSeen ? 1 : 0));
     recordIndicatorSequence(seqValue, seqMs, seqCount);
     if (crashSeen) {
         qca_err("Target did not initialize after the firmware event");
@@ -542,17 +552,17 @@ void QCAPCIDevice::recordIndicatorSequence(const u32 *values, const u32 *times,
     char key[40];
     for (unsigned i = 0; i < count; i++) {
         snprintf(key, sizeof(key), "QCAFwIndSeq%u", i);
-        qcaSetHexProp(fPciNub, key, values[i]);
+        setDiagProp(key, values[i]);
         snprintf(key, sizeof(key), "QCAFwIndSeqMs%u", i);
-        qcaSetHexProp(fPciNub, key, times[i]);
+        setDiagProp(key, times[i]);
     }
-    qcaSetHexProp(fPciNub, "QCAFwIndSeqLen", (u32)count);
+    setDiagProp("QCAFwIndSeqLen", (u32)count);
 }
 
 bool QCAPCIDevice::targetInitialized()
 {
     u32 val = read32(FW_INDICATOR_ADDRESS);
-    qcaSetHexProp(fPciNub, "QCAFwIndNow", val);
+    setDiagProp("QCAFwIndNow", val);
     return (val & FW_IND_INITIALIZED) != 0;
 }
 
@@ -562,7 +572,7 @@ void QCAPCIDevice::snapshotRegisters(const char *tag)
     for (unsigned i = 0; i < REG_SNAPSHOT_COUNT; i++) {
         u32 val = read32(kRegSnapshot[i]);
         snprintf(key, sizeof(key), "QCA%s%05x", tag, kRegSnapshot[i]);
-        qcaSetHexProp(fPciNub, key, val);
+        setDiagProp(key, val);
     }
 
     /* PCIe link and device status: a cold reset also resets the PCIe
@@ -577,23 +587,38 @@ void QCAPCIDevice::snapshotRegisters(const char *tag)
     cmd = fPciNub->configRead16(kIOPCIConfigCommand);
     bar0 = fPciNub->configRead32(kIOPCIConfigBaseAddress0);
     snprintf(key, sizeof(key), "QCA%sLinkSt", tag);
-    qcaSetHexProp(fPciNub, key, linkStatus);
+    setDiagProp(key, linkStatus);
     snprintf(key, sizeof(key), "QCA%sDevSt", tag);
-    qcaSetHexProp(fPciNub, key, devStatus);
+    setDiagProp(key, devStatus);
     snprintf(key, sizeof(key), "QCA%sCmd", tag);
-    qcaSetHexProp(fPciNub, key, cmd);
+    setDiagProp(key, cmd);
     snprintf(key, sizeof(key), "QCA%sBar0", tag);
-    qcaSetHexProp(fPciNub, key, bar0);
+    setDiagProp(key, bar0);
 }
 
 void QCAPCIDevice::setDiagProp(const char *key, u32 value)
 {
-    qcaSetHexProp(fPciNub, key, value);
+    char tagged[64];
+    qcaTaggedKey(tagged, sizeof(tagged), key, fDiagTag);
+    qcaSetHexProp(fPciNub, tagged, value);
 }
 
 void QCAPCIDevice::setDiagStr(const char *key, const char *value)
 {
-    if (fPciNub && value) fPciNub->setProperty(key, value);
+    if (!fPciNub || !value) return;
+    char tagged[64];
+    qcaTaggedKey(tagged, sizeof(tagged), key, fDiagTag);
+    fPciNub->setProperty(tagged, value);
+}
+
+void QCAPCIDevice::setDiagTag(const char *tag)
+{
+    if (tag) {
+        strncpy(fDiagTag, tag, sizeof(fDiagTag) - 1);
+        fDiagTag[sizeof(fDiagTag) - 1] = '\0';
+    } else {
+        fDiagTag[0] = '\0';
+    }
 }
 
 void QCAPCIDevice::dumpRegisterFingerprint(const char *tag)
@@ -604,7 +629,7 @@ void QCAPCIDevice::dumpRegisterFingerprint(const char *tag)
     for (unsigned i = 0; i < REG_FINGERPRINT_COUNT; i++) {
         u32 val = read32(kRegFingerprint[i]);
         snprintf(key, sizeof(key), "QCAReg%s%05x", tag, kRegFingerprint[i]);
-        qcaSetHexProp(fPciNub, key, val);
+        setDiagProp(key, val);
     }
 }
 
@@ -632,7 +657,7 @@ void QCAPCIDevice::applyLinkPowerPolicy()
             ctl &= ~0x1u;
             fPciNub->configWrite32(ctlOffset, ctl);
         }
-        qcaSetHexProp(fPciNub, "QCAL1SSCtl", fPciNub->configRead32(ctlOffset));
+        setDiagProp("QCAL1SSCtl", fPciNub->configRead32(ctlOffset));
     }
 }
 
@@ -663,27 +688,27 @@ void QCAPCIDevice::dumpAerState(const char *tag)
     char key[40];
     IOByteCount aer = (IOByteCount)findAerCapability();
 
-    qcaSetHexProp(fPciNub, "QCAAerCap", (u32)aer);
+    setDiagProp("QCAAerCap", (u32)aer);
     if (!aer) return;
 
-    qcaSetHexProp(fPciNub, "QCAAerUncorStatus",
+    setDiagProp("QCAAerUncorStatus",
                    fPciNub->extendedConfigRead32(aer + PCI_EXT_AER_UNCOR_STATUS));
-    qcaSetHexProp(fPciNub, "QCAAerUncorMask",
+    setDiagProp("QCAAerUncorMask",
                    fPciNub->extendedConfigRead32(aer + PCI_EXT_AER_UNCOR_MASK));
-    qcaSetHexProp(fPciNub, "QCAAerUncorSeverity",
+    setDiagProp("QCAAerUncorSeverity",
                    fPciNub->extendedConfigRead32(aer + PCI_EXT_AER_UNCOR_SEVERITY));
-    qcaSetHexProp(fPciNub, "QCAAerCorStatus",
+    setDiagProp("QCAAerCorStatus",
                    fPciNub->extendedConfigRead32(aer + PCI_EXT_AER_COR_STATUS));
-    qcaSetHexProp(fPciNub, "QCAAerCorMask",
+    setDiagProp("QCAAerCorMask",
                    fPciNub->extendedConfigRead32(aer + PCI_EXT_AER_COR_MASK));
-    qcaSetHexProp(fPciNub, "QCAAerCorSeverity",
+    setDiagProp("QCAAerCorSeverity",
                    fPciNub->extendedConfigRead32(aer + PCI_EXT_AER_COR_SEVERITY));
 
     /* Header log: the first dword holds the faulting address, the
        second the requester id and the last two the requester data. */
     for (unsigned i = 0; i < 4; i++) {
         snprintf(key, sizeof(key), "QCAAerLog%u", i);
-        qcaSetHexProp(fPciNub, key,
+        setDiagProp(key,
                        fPciNub->extendedConfigRead32(aer + PCI_EXT_AER_HEADER_LOG + i * 4));
     }
 
@@ -718,15 +743,15 @@ void QCAPCIDevice::dumpPcieState(const char *tag)
     u16 linkCtl2 = fPciNub->configRead16(fPcieCap + 0x30);
 
     snprintf(key, sizeof(key), "QCA%sLinkCtl", tag);
-    qcaSetHexProp(fPciNub, key, linkCtl);
+    setDiagProp(key, linkCtl);
     snprintf(key, sizeof(key), "QCA%sLinkSta", tag);
-    qcaSetHexProp(fPciNub, key, linkSta);
+    setDiagProp(key, linkSta);
     snprintf(key, sizeof(key), "QCA%sDevCtl", tag);
-    qcaSetHexProp(fPciNub, key, devCtl);
+    setDiagProp(key, devCtl);
     snprintf(key, sizeof(key), "QCA%sDevSta", tag);
-    qcaSetHexProp(fPciNub, key, devSta);
+    setDiagProp(key, devSta);
     snprintf(key, sizeof(key), "QCA%sLinkCtl2", tag);
-    qcaSetHexProp(fPciNub, key, linkCtl2);
+    setDiagProp(key, linkCtl2);
 }
 
 /* Full 256 byte dump of the standard configuration space. The values
@@ -755,25 +780,86 @@ void QCAPCIDevice::dumpPcieConfig(const char *tag)
 void QCAPCIDevice::captureCrashState(int elapsedMs)
 {
     char key[40];
-    qcaSetHexProp(fPciNub, "QCACrashMs", (u32)elapsedMs);
-    qcaSetHexProp(fPciNub, "QCACrashInd", read32(FW_INDICATOR_ADDRESS));
-    qcaSetHexProp(fPciNub, "QCACrashCtrl", read32(SOC_CORE_BASE_ADDRESS + CORE_CTRL_ADDRESS));
-    qcaSetHexProp(fPciNub, "QCACrashIntrEn", read32(SOC_CORE_BASE_ADDRESS + PCIE_INTR_ENABLE_ADDRESS));
-    qcaSetHexProp(fPciNub, "QCACrashIntrCause", read32(SOC_CORE_BASE_ADDRESS + PCIE_INTR_CAUSE_ADDRESS));
-    qcaSetHexProp(fPciNub, "QCACrashScratch", read32(RTC_SOC_BASE_ADDRESS + SCRATCH_3_ADDRESS));
-    qcaSetHexProp(fPciNub, "QCACrashResetCtl", read32(RTC_SOC_BASE_ADDRESS + SOC_RESET_CONTROL_ADDRESS));
+    setDiagProp("QCACrashMs", (u32)elapsedMs);
+    setDiagProp("QCACrashInd", read32(FW_INDICATOR_ADDRESS));
+    setDiagProp("QCACrashCtrl", read32(SOC_CORE_BASE_ADDRESS + CORE_CTRL_ADDRESS));
+    setDiagProp("QCACrashIntrEn", read32(SOC_CORE_BASE_ADDRESS + PCIE_INTR_ENABLE_ADDRESS));
+    setDiagProp("QCACrashIntrCause", read32(SOC_CORE_BASE_ADDRESS + PCIE_INTR_CAUSE_ADDRESS));
+    setDiagProp("QCACrashScratch", read32(RTC_SOC_BASE_ADDRESS + SCRATCH_3_ADDRESS));
+    setDiagProp("QCACrashResetCtl", read32(RTC_SOC_BASE_ADDRESS + SOC_RESET_CONTROL_ADDRESS));
 
     /* Copy Engine error and status registers: they show whether the
        host and the target disagreed about the ring layout. */
     for (unsigned i = 0; i < CE_ERROR_REGISTER_COUNT; i++) {
         snprintf(key, sizeof(key), "QCACrashCE%05x", kCeErrorRegisters[i]);
-        qcaSetHexProp(fPciNub, key, read32(kCeErrorRegisters[i]));
+        setDiagProp(key, read32(kCeErrorRegisters[i]));
     }
 
     snapshotRegisters("Crash");
     dumpPcieState("Crash");
     dumpPcieConfig("Crash");
     dumpAerState("Crash");
+}
+
+/* Dump the target's view of the PCIe setup (struct pcie_state). This
+   reveals what the target thinks about the MSI grant, the message
+   address/data and the power management method. A target that never
+   sees a non-zero msi_granted will never leave the bootloader. */
+void QCAPCIDevice::dumpTargetPcieState(const char *tag)
+{
+    if (!fCopyEngine) return;
+    u32 interconnectAddr = QCA_HOST_INTEREST + HI_INTERCONNECT_STATE_OFFSET;
+    u32 pcieStateAddr = 0;
+    if (fCopyEngine->diagReadMem(interconnectAddr, &pcieStateAddr, sizeof(pcieStateAddr)) != 0) return;
+    if (!pcieStateAddr) return;
+
+    char key[40];
+    for (unsigned i = 0; i < PCIE_STATE_WORD_COUNT; i++) {
+        u32 val = 0;
+        if (fCopyEngine->diagReadMem(pcieStateAddr + i * 4, &val, sizeof(val)) != 0) continue;
+        snprintf(key, sizeof(key), "QCA%sTgtPcie%u", tag, i);
+        setDiagProp(key, val);
+    }
+}
+
+/* Enable the SoC core PCIe interrupt enable register (ath10k_pci_init_irq_intx).
+   The endpoint uses this register to raise the firmware and Copy Engine
+   interrupts to the host. */
+void QCAPCIDevice::enablePcieInterrupts()
+{
+    write32(SOC_CORE_BASE_ADDRESS + PCIE_INTR_ENABLE_ADDRESS,
+            PCIE_INTR_FIRMWARE_MASK | PCIE_INTR_CE_MASK_ALL);
+}
+
+/* Assert or de-assert the CPU interrupt mask in CORE_CTRL (ath10k_pci_wake_target_cpu).
+   The target ROM may wait for this interrupt before advancing to INITIALIZED. */
+void QCAPCIDevice::setCoreCtrlIntr(bool assert)
+{
+    u32 ctrl = read32(SOC_CORE_BASE_ADDRESS + CORE_CTRL_ADDRESS);
+    if (assert) ctrl |= CORE_CTRL_CPU_INTR_MASK;
+    else ctrl &= ~CORE_CTRL_CPU_INTR_MASK;
+    write32(SOC_CORE_BASE_ADDRESS + CORE_CTRL_ADDRESS, ctrl);
+}
+
+/* Clear the PCI Device Control bit 13 (Disable INTx). macOS never programs
+   the MSI capability on this endpoint, so the device is left without any
+   interrupt path. */
+void QCAPCIDevice::clearDisableIntx()
+{
+    if (!fPcieCap) return;
+    u16 devCtl = fPciNub->configRead16(fPcieCap + 0x08);
+    if (devCtl & PCI_EXP_DEVCTL_DISABLE_INTX) {
+        devCtl &= ~PCI_EXP_DEVCTL_DISABLE_INTX;
+        fPciNub->configWrite16(fPcieCap + 0x08, devCtl);
+    }
+}
+
+/* Walk the standard PCI capability list for a capability id. */
+UInt8 QCAPCIDevice::findStandardCapability(UInt8 capabilityId)
+{
+    UInt8 capPtr = 0;
+    fPciNub->findPCICapability(capabilityId, &capPtr);
+    return capPtr;
 }
 
 /* Convert a target CPU address into the address space the Copy Engine
@@ -892,7 +978,7 @@ int QCAPCIDevice::initConfig()
         qca_err("Failed to read the interconnect state address");
         return -1;
     }
-    qcaSetHexProp(fPciNub, "QCAInterconnectAddr", pcieStateAddr);
+    setDiagProp("QCAInterconnectAddr", pcieStateAddr);
     if (!pcieStateAddr) {
         qca_err("Invalid interconnect state address");
         return -1;
@@ -903,7 +989,7 @@ int QCAPCIDevice::initConfig()
         qca_err("Failed to read the pipe configuration address");
         return -1;
     }
-    qcaSetHexProp(fPciNub, "QCAPipeCfgAddr", pipeCfgAddr);
+    setDiagProp("QCAPipeCfgAddr", pipeCfgAddr);
     if (!pipeCfgAddr) {
         qca_err("Invalid pipe configuration address");
         return -1;
@@ -921,7 +1007,7 @@ int QCAPCIDevice::initConfig()
         qca_err("Failed to read the service-to-pipe map address");
         return -1;
     }
-    qcaSetHexProp(fPciNub, "QCASvcToPipeAddr", svcToPipeMap);
+    setDiagProp("QCASvcToPipeAddr", svcToPipeMap);
     if (!svcToPipeMap) {
         qca_err("Invalid service-to-pipe map address");
         return -1;
@@ -964,7 +1050,7 @@ int QCAPCIDevice::initConfig()
         qca_err("Failed to write the early allocation value");
         return -1;
     }
-    qcaSetHexProp(fPciNub, "QCAEarlyAlloc", eallocValue);
+    setDiagProp("QCAEarlyAlloc", eallocValue);
 
     /* Tell the target to proceed with the initialization. */
     flag2Addr = QCA_HOST_INTEREST + HI_OPTION_FLAG2_OFFSET;
@@ -977,7 +1063,7 @@ int QCAPCIDevice::initConfig()
         qca_err("Failed to write the option flag 2 value");
         return -1;
     }
-    qcaSetHexProp(fPciNub, "QCAOptionFlag2", flag2Value);
+    setDiagProp("QCAOptionFlag2", flag2Value);
 
     qca_info("Early configuration downloaded to the target");
     return 0;
@@ -1122,49 +1208,32 @@ int QCAPCIDevice::configureTarget()
 
 bool QCAPCIDevice::bootFirmware()
 {
-    /* 1. Cold reset (ath10k_pci_cold_reset). */
+    /* 1. Strong force-wake BEFORE any reset (ath10k_pci_force_wake).
+       The target must be fully powered before we touch it. */
+    if (!forceWake()) {
+        qca_err("Force-wake failed before cold reset");
+        return false;
+    }
+
+    /* 2. Clear PCI Device Control bit 13 (Disable INTx). macOS never
+       programs the MSI capability, so the device is left without any
+       interrupt path unless we clear this. */
+    clearDisableIntx();
+
+    /* 3. Cold reset (ath10k_pci_cold_reset). */
     setDiagStr("QCAResetSeq", "cold1");
     chipReset();
-    fPciNub->setProperty("QCAStartStage", "fw-wait");
 
-    /* 2. Wait for the ROM bootloader after the cold reset. ath10k's
-       qca6174 reset needs cold *and* warm reset (its FIXME says "QCA6174
-       requires cold + warm reset to work"), and the warm reset is what
-       pulses the CPU release. A timeout here is therefore not fatal:
-       the warm reset below waits again. */
-    if (waitForTargetInit() != 0) {
-        qca_info("ROM indicator not seen after cold reset");
-        setDiagStr("QCAIndAfterCold", "no");
-    } else {
-        setDiagStr("QCAIndAfterCold", "yes");
-    }
+    /* 4. Brief settle: let the ROM initialize hardware (including the
+       Copy Engine diagnostic window). ath10k waits for INITIALIZED here,
+       but on this hardware the ROM waits for initConfig first. */
+    setDiagStr("QCAStartStage", "fw-settle");
+    IOSleep(200);  // 200 ms for ROM to init CE hardware
 
-    /* 3. Bring the target up. Several reset shapes are tried because
-       ath10k resets the chip twice during probe (once in the PCI probe
-       and once in ath10k_pci_hif_power_up); every variant is recorded
-       so the next boot shows which one worked. */
-    if (!targetInitialized()) {
-        setDiagStr("QCAResetSeq", "warm1");
-        if (warmReset() != 0) {
-            qca_err("Target did not respond after the first warm reset");
-            setDiagStr("QCAResetSeq", "cold2");
-            chipReset();
-            if (waitForTargetInit(1500) != 0) {
-                setDiagStr("QCAResetSeq", "warm2");
-                warmReset();
-            }
-        }
-    }
-    setDiagStr("QCAIndAfterWarm", targetInitialized() ? "yes" : "no");
-    snapshotRegisters("Warm");
-
-    fPciNub->setProperty("QCAStartStage", "fw-target-info");
-
-    /* 4. Download the target-side Copy Engine configuration and the
+    /* 5. Download the target-side Copy Engine configuration and the
        service-to-CE map, then release the target from its early
        configuration wait (ath10k_pci_init_config). This step uses the
-       Copy Engine 7 diagnostic window, so it only works once the ROM
-       is alive. */
+       Copy Engine 7 diagnostic window, which the ROM initializes early. */
     setDiagStr("QCAStartStage", "fw-init-config");
     if (initConfig() != 0) {
         qca_warn("Early configuration download failed; continuing");
@@ -1173,15 +1242,22 @@ bool QCAPCIDevice::bootFirmware()
         setDiagStr("QCAInitConfig", "ok");
     }
 
-    /* 5. Enable the target CPU's PCIe interrupt line before BMI
-       traffic (ath10k_pci_wake_target_cpu). */
-    u32 ctrl = read32(SOC_CORE_BASE_ADDRESS + CORE_CTRL_ADDRESS);
-    write32(SOC_CORE_BASE_ADDRESS + CORE_CTRL_ADDRESS,
-            ctrl | CORE_CTRL_CPU_INTR_MASK);
+    /* 6. Now wait for the ROM to signal INITIALIZED. The target should
+       advance to INITIALIZED after the host sets EARLY_CFG_DONE. */
+    setDiagStr("QCAStartStage", "fw-wait-init");
+    if (waitForTargetInit(3000) != 0) {
+        qca_err("Target did not reach INITIALIZED after initConfig");
+        return false;
+    }
+    setDiagStr("QCAIndAfterConfig", "yes");
 
-    /* 6. Query ROM target info. This doubles as the authoritative
-       liveness probe: a live ROM answers even if the firmware
-       indicator was never written. */
+    /* 7. Enable PCIe interrupts on the SoC core and assert CPU_INTR_MASK
+       (ath10k_pci_wake_target_cpu). Now that the target is initialized,
+       it can handle interrupts. */
+    enablePcieInterrupts();
+    setCoreCtrlIntr(true);
+
+    /* 8. Query ROM target info — authoritative liveness probe. */
     setDiagStr("QCAStartStage", "fw-bmi-send");
     snapshotRegisters("Bmi");
     struct bmi_target_info info;
@@ -1193,15 +1269,15 @@ bool QCAPCIDevice::bootFirmware()
     qca_info("Target Xtensa CPU active: version 0x%08x type 0x%08x", info.version, info.type);
     setDiagStr("QCAStartStage", "fw-bmi-ok");
 
-    /* 7. Enable the PLL clock before bulk transfers
+    /* 9. Enable the PLL clock before bulk transfers
        (ath10k_hw_qca6174_enable_pll_clock; failure is non-fatal). */
     setDiagStr("QCAStartStage", "fw-pll");
     if (enablePllClock() != 0) {
         qca_info("PLL clock config failed; continuing at ROM clock");
     }
 
-    /* 8. Configure the target's shared host-interest settings before
-       board and firmware download (ath10k_init_configure_target). */
+    /* 10. Configure the target's shared host-interest settings before
+        board and firmware download (ath10k_init_configure_target). */
     setDiagStr("QCAStartStage", "fw-config");
     if (configureTarget() != 0) {
         qca_err("Target configuration failed");

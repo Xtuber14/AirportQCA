@@ -57,6 +57,7 @@ public:
         write32Raw(offset, val);
     }
 
+    bool forceWake();
     bool wakeTarget();
     void markTargetAsleep();
     void dumpRegisterFingerprint(const char *tag);
@@ -83,6 +84,12 @@ public:
     void setDiagProp(const char *key, u32 value);
     void setDiagStr(const char *key, const char *value);
 
+    /* Diagnostic properties carry a short experiment tag so that several
+       reset experiments can run inside one boot without overwriting
+       each other's results. The tag is inserted right behind the "QCA"
+       prefix, e.g. "QCAFwIndNow" becomes "QCAE1FwIndNow". */
+    void setDiagTag(const char *tag);
+
     /* Hardware Resets */
     int warmReset();
     int chipReset();
@@ -92,6 +99,20 @@ public:
     /* Target bring-up helpers */
     int enablePllClock();
     int configureTarget();
+
+    /* Interrupt plumbing. The endpoint raises the firmware and Copy
+       Engine interrupts through the SoC core interrupt enable register
+       (ath10k_pci_init_irq_intx) and asserts the CPU interrupt through
+       CORE_CTRL. */
+    void enablePcieInterrupts();
+    void setCoreCtrlIntr(bool assert);
+    void clearDisableIntx();
+
+    /* Walk the standard capability list for a capability id. */
+    UInt8 findStandardCapability(UInt8 capabilityId);
+
+    /* The target's own view of the PCIe setup (struct pcie_state). */
+    void dumpTargetPcieState(const char *tag);
 
     /* Convert a target CPU address into the address space the Copy
        Engine understands (ath10k_pci_qca6174_targ_cpu_to_ce_addr). */
@@ -148,6 +169,7 @@ private:
     bool             fTargetAwake;
     UInt8            fPcieCap;
     UInt32           fL1PMSubstatesCap;
+    char             fDiagTag[8];
 };
 
 #endif /* _QCA_PCI_DEVICE_HPP_ */
