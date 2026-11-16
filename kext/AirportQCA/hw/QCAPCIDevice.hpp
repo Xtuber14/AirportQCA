@@ -57,10 +57,13 @@ public:
         write32Raw(offset, val);
     }
 
+    bool forceWake();
     bool wakeTarget();
     void markTargetAsleep();
     void dumpRegisterFingerprint(const char *tag);
     void snapshotRegisters(const char *tag);
+    /* Store the recorded firmware indicator sequence in the registry. */
+    void recordIndicatorSequence(const u32 *values, const u32 *times, unsigned count);
 
     /* PCIe link/config diagnostics. The target ROM is sensitive to the
        PCIe state, so the link policy and the configuration space are
@@ -71,10 +74,21 @@ public:
     void dumpPcieConfig(const char *tag);
     void captureCrashState(int elapsedMs);
 
+    /* PCIe Advanced Error Reporting capability: the error status and the
+       header log identify the transaction that upset the target ROM. */
+    UInt32 findAerCapability();
+    void dumpAerState(const char *tag);
+
     /* Registry breadcrumbs. The driver's IOLog output never reaches the
        unified log, so every bring-up value is mirrored into ioreg. */
     void setDiagProp(const char *key, u32 value);
     void setDiagStr(const char *key, const char *value);
+
+    /* Diagnostic properties carry a short experiment tag so that several
+       reset experiments can run inside one boot without overwriting
+       each other's results. The tag is inserted right behind the "QCA"
+       prefix, e.g. "QCAFwIndNow" becomes "QCAE1FwIndNow". */
+    void setDiagTag(const char *tag);
 
     /* Hardware Resets */
     int warmReset();
@@ -86,9 +100,29 @@ public:
     int enablePllClock();
     int configureTarget();
 
+    /* Interrupt plumbing. The endpoint raises the firmware and Copy
+       Engine interrupts through the SoC core interrupt enable register
+       (ath10k_pci_init_irq_intx) and asserts the CPU interrupt through
+       CORE_CTRL. */
+    void enablePcieInterrupts();
+    void setCoreCtrlIntr(bool assert);
+    void clearDisableIntx();
+
+    /* Walk the standard capability list for a capability id. */
+    UInt8 findStandardCapability(UInt8 capabilityId);
+
+    /* The target's own view of the PCIe setup (struct pcie_state). */
+    void dumpTargetPcieState(const char *tag);
+
     /* Convert a target CPU address into the address space the Copy
        Engine understands (ath10k_pci_qca6174_targ_cpu_to_ce_addr). */
     u32 targCpuToCeAddr(u32 addr);
+
+    /* Map an HTC service id to the Copy Engine pipes used for the
+       uplink (host -> target) and the downlink (target -> host)
+       direction. Both the host and the target use the same table, so
+       they always agree (ath10k_pci_hif_map_service_to_pipe). */
+    bool mapServiceToPipe(u16 serviceId, u8 *ulPipe, u8 *dlPipe) const;
 
     /* Download the target-side Copy Engine configuration and the
        service-to-CE map, then release the target from its early
@@ -135,6 +169,7 @@ private:
     bool             fTargetAwake;
     UInt8            fPcieCap;
     UInt32           fL1PMSubstatesCap;
+    char             fDiagTag[8];
 };
 
 #endif /* _QCA_PCI_DEVICE_HPP_ */

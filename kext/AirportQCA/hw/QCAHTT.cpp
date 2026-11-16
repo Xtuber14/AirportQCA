@@ -111,18 +111,21 @@ bool QCAHTT::init()
     u8 response[64];
     for (u32 retry = 0; retry < 3000 && !versionReceived; ++retry) {
         u32 length = sizeof(response);
-        if (ce->recv(5, response, &length) == 0) {
-            if (length < sizeof(ath10k_htc_hdr) + 4) continue;
-            const auto *transport = (const ath10k_htc_hdr *)response;
-            const u8 *payload = response + sizeof(*transport);
-            if (transport->eid != ATH10K_HTC_EP_2 || payload[0] != 0) continue;
-            const u8 major = payload[2];
+        /* The HTT data endpoint uses CE1 on the QCA6174 family and
+           shares it with the HTC control endpoint, so the frame is
+           taken through the HTC layer, which demultiplexes it. The
+           payload is the HTT response header: msg type, minor, major
+           (struct htt_ver_resp). */
+        if (htc->recv(ATH10K_HTC_EP_2, response, &length) == 0) {
+            if (length < 4) continue;
+            if (response[0] != 0) continue;
+            const u8 major = response[2];
             if (major != 2 && major != 3) {
-                qca_err("Unsupported HTT target version %u.%u", major, payload[1]);
+                qca_err("Unsupported HTT target version %u.%u", major, response[1]);
                 return false;
             }
             versionReceived = true;
-            qca_info("HTT target protocol version %u.%u", major, payload[1]);
+            qca_info("HTT target protocol version %u.%u", major, response[1]);
         } else {
             qca_mdelay(1);
         }
@@ -285,23 +288,22 @@ void QCAHTT::completeMsdu(u16 msduId)
 
 void QCAHTT::receivePackets()
 {
-    QCACopyEngine *ce = fPci->getCopyEngine();
-    if (!ce) return;
+    QCAHTC *htc = fPci->getHTC();
+    if (!htc) return;
     for (u32 count = 0; count < 64; ++count) {
-        u8 frame[2048];
-        u32 frameLength = sizeof(frame);
-        if (ce->recv(5, frame, &frameLength) != 0) break;
-        if (frameLength < sizeof(ath10k_htc_hdr) + 4) continue;
-        const auto *htc = (const ath10k_htc_hdr *)frame;
-        if (htc->eid != ATH10K_HTC_EP_2) continue;
-        const u8 *htt = frame + sizeof(*htc);
-        u32 httLength = frameLength - sizeof(*htc);
-        if (htt[0] != HTT_T2H_TX_COMPLETE || httLength < 4) continue;
-        const u32 numMsdu = htt[2];
-        if (numMsdu > 255 || httLength < 4 + numMsdu * sizeof(__le16)) continue;
+        u8 payload[2048];
+        u32 payloadLength = sizeof(payload);
+        /* The frame is taken through the HTC layer: on the QCA6174
+           family the HTT data endpoint shares CE1 with the HTC
+           control endpoint. */
+        if (htc->recv(ATH10K_HTC_EP_2, payload, &payloadLength) != 0) break;
+        if (payloadLength < 4) continue;
+        if (payload[0] != HTT_T2H_TX_COMPLETE) continue;
+        const u32 numMsdu = payload[2];
+        if (numMsdu > 255 || payloadLength < 4 + numMsdu * sizeof(__le16)) continue;
         for (u32 i = 0; i < numMsdu; ++i) {
             __le16 rawId;
-            memcpy(&rawId, htt + 4 + i * sizeof(rawId), sizeof(rawId));
+            memcpy(&rawId, payload + 4 + i * sizeof(rawId), sizeof(rawId));
             completeMsdu(le16_to_cpu(rawId));
         }
     }

@@ -76,6 +76,29 @@
 #define FW_IND_EVENT_PENDING                0x00000001
 #define FW_IND_INITIALIZED                  0x00000002
 
+/* PCIe extended capability space. The Advanced Error Reporting (AER)
+   capability describes every PCIe error the endpoint saw; its header log
+   even holds the address of the offending transaction, which is the
+   quickest way to find out what killed the target ROM. */
+#define PCI_EXT_CAP_START                  0x00000100
+#define PCI_EXT_CAP_END                    0x00000400
+#define PCI_EXT_CAP_ID_AER                 0x0001
+#define PCI_EXT_CAP_ID_L1PM_SUBSTATES      0x001e
+#define PCI_EXT_CAP_NEXT_SHIFT             20
+#define PCI_EXT_CAP_NEXT_MASK              0x00000FFF
+
+/* AER capability register offsets (PCIe base specification 2.0). */
+#define PCI_EXT_AER_UNCOR_STATUS           0x00000004
+#define PCI_EXT_AER_UNCOR_MASK             0x00000008
+#define PCI_EXT_AER_UNCOR_SEVERITY         0x0000000C
+#define PCI_EXT_AER_COR_STATUS             0x00000010
+#define PCI_EXT_AER_COR_MASK               0x00000014
+#define PCI_EXT_AER_COR_SEVERITY           0x00000018
+#define PCI_EXT_AER_STATUS_UPPER           0x0000001C
+#define PCI_EXT_AER_ROOT_ERROR_COMMAND     0x0000002C
+#define PCI_EXT_AER_ROOT_ERROR_STATUS      0x00000030
+#define PCI_EXT_AER_HEADER_LOG             0x00000038
+
 /* Copy Engine Base Offsets (QCA6174 / QCA9377, stride 0x400) */
 #define CE0_BASE_ADDRESS                    0x00034400
 #define CE1_BASE_ADDRESS                    0x00034800
@@ -223,11 +246,36 @@ static inline int _qcaLsb(u32 mask)
 #define QCA9377_IRAM_BANKS                  9
 
 /* struct pcie_state (ath10k pci.h): the target hands the host the
-   addresses of the pipe configuration and of the service-to-pipe map. */
+   addresses of the pipe configuration and of the service-to-pipe map.
+   The structure also carries the MSI handshake (how many message
+   signalled interrupts the target asks for, how many the host granted
+   and the message address/data the target expects) plus the PCIe power
+   management method. The host only ever looks at the first two fields
+   in ath10k, but the remaining fields are the target's view of the
+   PCIe setup and are dumped for diagnostics: a target that waits for
+   an MSI grant never leaves the boot loader. */
 #define PCIE_STATE_PIPE_CFG_ADDR_OFFSET     0x00000000
 #define PCIE_STATE_SVC_TO_PIPE_MAP_OFFSET   0x00000004
+#define PCIE_STATE_MSI_REQUESTED_OFFSET     0x00000008
+#define PCIE_STATE_MSI_GRANTED_OFFSET      0x0000000C
+#define PCIE_STATE_MSI_ADDR_OFFSET          0x00000010
+#define PCIE_STATE_MSI_DATA_OFFSET          0x00000014
+#define PCIE_STATE_MSI_FW_INTR_DATA_OFFSET  0x00000018
+#define PCIE_STATE_POWER_MGMT_METHOD_OFFSET 0x0000001C
 #define PCIE_STATE_CONFIG_FLAGS_OFFSET      0x00000020
+#define PCIE_STATE_WORD_COUNT               9
 #define PCIE_CONFIG_FLAG_ENABLE_L1          0x00000001
+
+/* Standard PCI capability ids used by the configuration-space dumper. */
+#define PCI_CAP_ID_PM                        0x01
+#define PCI_CAP_ID_MSI                       0x05
+#define PCI_CAP_ID_PCIE                      0x10
+
+/* PCIe Device Control register (capability + 0x08). Bit 13 disables the
+   legacy INTx interrupt line; the endpoint advertises MSI but macOS
+   never programs the MSI capability, so the device is left without any
+   way to raise an interrupt. */
+#define PCI_EXP_DEVCTL_DISABLE_INTX         0x2000
 
 /* Pipe directions (ath10k ce.h). The directions are relative to the
    host, so PIPEDIR_OUT means host -> target. */
